@@ -236,14 +236,44 @@ the transport grid. Every extra electrode costs one sampling pass and one cached
 python3 gui/app.py
 ```
 
-Tabs: Log, Summary, Plots, Waveforms, Integrals, 3D Tracks, E-Field, Weighting Field, Magboltz. The
-GUI writes a temporary JSON and runs the same binary — it never re-implements physics. Two exceptions
-are deliberate: the derived-potential label and the mesh-snap label duplicate the C++ arithmetic in
-Python, so a disagreement is visible before anything is solved.
+Tabs: Log, Summary, Plots, Waveforms, Integrals, **Geometry**, 3D Tracks, E-Field, Weighting Field,
+Magboltz. The GUI writes a temporary JSON and runs the same binary — it never re-implements physics.
+Two exceptions are deliberate: the derived-potential label and the mesh-snap label duplicate the C++
+arithmetic in Python, so a disagreement is visible before anything is solved.
 
-Note what the x–z slice does to a woven mesh: it cuts the lower layer (wires ∥ y) transversely, drawn
-as ticks, while the upper layer (wires ∥ x) is cut lengthwise and cannot be resolved in x at all. The
-upper layer is drawn as a single dashed line marking its plane — it is not a solid sheet.
+### The Geometry tab
+
+The resolved stack on its own, drawn from a run's `run_config.json` — so it needs no transported
+events, and **`Load run …` opens any run directory from any earlier session**, which matters when a
+cold solve of the default takes an hour.
+
+- **The periodic cell** is drawn solid, heavy and magenta; the tiled display copies are dotted, thin
+  and grey, footprints only. Three cues at once, because everything except that one box is a
+  convenience of the display rather than something that was solved.
+- **The woven mesh's two layers are separated by colour and line style** — upper (wires ∥ x) at
+  `z_upper`, lower (wires ∥ y) at `z_lower`. They are one electrode at one potential; the split says
+  which layer is which, and the annotation column says so explicitly.
+- **The THGEM hole is drawn as its three real z-segments**, so an etched rim is visible instead of
+  being averaged into a single barrel.
+- **The annotation column** lists every z plane and derived potential, each gap's thickness and its
+  field, the mesh lattice and optical transparency, and the two transport-grid budgets — reddened at
+  the same thresholds the binary's own validation warns at. The gap fields are recomputed there as
+  |ΔV|/Δz rather than read back from `fields`, which makes the column a live cross-check of the
+  potential chain.
+- **The cut-away** removes geometry on one side of an axis-aligned plane: spans are truncated, round
+  cross-sections are restricted to the exact surviving arc, and zero-thickness planes are culled or
+  clipped. It is a filter over wireframe outlines — it does **not** cap the section into a solid
+  face, and ROOT's 3D painter does not depth-sort, so the far half of what remains still draws over
+  the near half.
+
+Drawing is budgeted: a fine mesh at many tiled copies runs to thousands of `TPolyLine3D`, so the tab
+projects the cost first and coarsens along a fixed ladder if needed — announcing what it reduced in
+the Qt status label, the canvas annotation and the log, never silently.
+
+Note what the E-Field tab's x–z slice does to a woven mesh: it cuts the lower layer (wires ∥ y)
+transversely, drawn as ticks, while the upper layer (wires ∥ x) is cut lengthwise and cannot be
+resolved in x at all. The upper layer is drawn as a single dashed line marking its plane — it is not
+a solid sheet.
 
 ## Layout
 

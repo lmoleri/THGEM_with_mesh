@@ -100,6 +100,38 @@ ELECTRODE_COLOR_OFFSETS = {
 }
 
 
+# Geometry-tab wireframe styling: (ROOT colour base, offset, line style).
+# The electrode rows mirror ELECTRODE_COLOR_OFFSETS so a conductor keeps one
+# colour across Waveforms, Integrals, Weighting Field and Geometry.  The two
+# mesh rows are the exception: a woven mesh is a *single* electrode at a single
+# potential, drawn as two crossed layers — split by hue and line style so you
+# can tell which layer is which, not because they are two electrodes.
+_GEO_STYLE = {
+    "wire_cathode": ("kCyan",    2, 1),
+    "thgem_cu_top": ("kOrange",  7, 1),
+    "thgem_cu_bot": ("kRed",     1, 1),
+    "thgem_diel":   ("kGray",    2, 1),
+    "mesh_upper":   ("kTeal",    3, 1),   # wires along x, at z_upper_cm
+    "mesh_lower":   ("kAzure",   7, 2),   # wires along y, at z_lower_cm, dashed
+    "anode":        ("kBlue",    1, 1),
+    "cell":         ("kMagenta", 1, 1),   # the neBEM cell that was solved
+    "copies":       ("kGray",    1, 3),   # tiled display copies
+    "cut":          ("kRed",     1, 7),
+}
+
+
+def geo_color(key):
+    """ROOT colour index for one _GEO_STYLE key (needs PyROOT imported)."""
+    import ROOT  # noqa: PLC0415
+    base, off, _ = _GEO_STYLE.get(key, ("kBlack", 0, 1))
+    return getattr(ROOT, base) + off
+
+
+def geo_style(key):
+    """ROOT line style for one _GEO_STYLE key."""
+    return _GEO_STYLE.get(key, ("kBlack", 0, 1))[2]
+
+
 def electrode_color(eid):
     """ROOT colour index for one electrode id (lazy: needs PyROOT imported)."""
     import ROOT
@@ -1337,6 +1369,476 @@ class MplCanvas(FigureCanvasQTAgg):
 
 
 # ---------------------------------------------------------------------------
+# Wireframe geometry painter
+# ---------------------------------------------------------------------------
+
+# Refuse to draw more than this many TPolyLine3D in one pass.  Tuned to where
+# ROOT's 3D pad stops rotating smoothly on macOS.  Not a user knob: the
+# reduction ladder below handles overflow by coarsening and *saying so*.
+_GEO_OBJECT_BUDGET = 4000
+
+# (note, cylinder facets, wire facets, tiling scale) — the first rung whose
+# projected primitive count fits the budget wins.  Ordered so the least
+# noticeable degradation comes first.
+_GEO_REDUCTION_LADDER = [
+    ("",                             12, 8, 1.00),
+    ("wire facets 8 #rightarrow 6",  12, 6, 1.00),
+    ("facets 12/8 #rightarrow 8/4",   8, 4, 1.00),
+    ("facets, tiling #times3/4",      8, 4, 0.75),
+    ("facets, tiling #times1/2",      6, 4, 0.50),
+    ("facets, tiling #times1/3",      6, 4, 0.33),
+    ("wires as centre-lines",         6, 1, 0.33),
+    ("solved cell only",              6, 1, 0.00),
+]
+
+
+class _BudgetExceeded(Exception):
+    """Raised by _GeoView when a draw pass runs past its primitive budget."""
+
+
+class _GeoView:
+    """The detector stack as a TPolyLine3D wireframe in a TH3F-framed 3D pad.
+
+    This holds what used to be captured by closure inside _update_track_plot:
+    the visible cube, the periodic-cell dimensions, the tiling count and the
+    keep-alive list — plus, new here, an optional cut plane.
+
+    Making the cube explicit is not only tidier, it removes a real bug: the
+    closures read the view centre from locals named px/py/pz, which
+    _update_track_plot later rebinds to the primary track's coordinate arrays.
+
+    Cut convention: `cut_axis` in {None, "x", "y", "z"} and the kept half-space
+    is ``cut_keep * (coord - cut_pos) >= 0``, so cut_keep = -1 keeps the low
+    side.  Three behaviours, by feature type:
+      * truncate  — anything with an interval extent along the cut axis
+      * arc-restrict — round cross-sections cut transversely (closed form)
+      * cull      — zero-thickness features on the hidden side
+    It is a display filter over wireframe outlines: no CSG, no capped faces and
+    no hidden-line removal (ROOT's TPolyLine3D painter does not depth-sort, so
+    the far half of what survives still overdraws the near half).
+
+    Every primitive must be appended to `objects`: ROOT does not own a
+    TPolyLine3D drawn with "SAME", so anything not referenced from Python is
+    garbage-collected straight back out of the canvas.
+    """
+
+    __slots__ = ("R", "objects", "cx", "cy", "cz", "hr", "cell_x", "cell_y",
+                 "pitch", "n_holes", "cut_axis", "cut_pos", "cut_keep",
+                 "s_cyl", "s_wire", "budget", "n_obj")
+
+    def __init__(self, root, objects, centre, hr, cell_x, cell_y, pitch,
+                 n_holes=1, cut_axis=None, cut_pos=0.0, cut_keep=-1,
+                 s_cyl=12, s_wire=8, budget=0):
+        self.R = root
+        self.objects = objects
+        self.cx, self.cy, self.cz = (float(c) for c in centre)
+        self.hr       = float(hr)
+        self.cell_x   = float(cell_x)
+        self.cell_y   = float(cell_y)
+        self.pitch    = float(pitch)
+        self.n_holes  = max(1, int(n_holes))
+        self.cut_axis = cut_axis if cut_axis in ("x", "y", "z") else None
+        self.cut_pos  = float(cut_pos)
+        self.cut_keep = 1 if cut_keep > 0 else -1
+        self.s_cyl    = max(3, int(s_cyl))
+        self.s_wire   = max(1, int(s_wire))
+        self.budget   = int(budget)      # 0 = unlimited (the 3D Tracks tab)
+        self.n_obj    = 0
+
+    # ── bookkeeping ──────────────────────────────────────────────────────
+    def tile_range(self):
+        """Display-copy indices, centred on the solved cell."""
+        half = self.n_holes // 2
+        return range(-half, self.n_holes - half)
+
+    def _add(self, obj):
+        obj.Draw("SAME")
+        self.objects.append(obj)
+        self.n_obj += 1
+        # 1.25x, not 1.0: the estimator is meant to have already picked a rung
+        # that fits, so this only catches an estimator miss — and it should
+        # leave a labelled partial picture rather than trip on a rounding error.
+        if self.budget and self.n_obj > 1.25 * self.budget:
+            raise _BudgetExceeded(f"{self.n_obj} primitives")
+
+    def _line(self, xs, ys, zs, color, width=1, alpha=1.0, style=1):
+        ln = self.R.TPolyLine3D(len(xs), np.asarray(xs, "f4"),
+                                np.asarray(ys, "f4"), np.asarray(zs, "f4"))
+        if alpha < 1.0:
+            ln.SetLineColorAlpha(color, alpha)
+        else:
+            ln.SetLineColor(color)
+        ln.SetLineWidth(width)
+        ln.SetLineStyle(style)
+        self._add(ln)
+
+    # ── cut-plane primitives ─────────────────────────────────────────────
+    @staticmethod
+    def _arc(c_a, c_b, r, n_a, n_b, p, keep):
+        """Angular range of circle (c_a, c_b, r) kept by keep*(n.x - p) >= 0.
+
+        On the circle the half-plane test is c0 + r*cos(t - phi) >= p with
+        c0 = n.c and phi = atan2(n_b, n_a), so the kept set is a single arc.
+        Returns (t0, t1) with t1 > t0, (0, 2pi) if the whole circle survives,
+        or None if none of it does.
+        """
+        if r <= 0.:
+            return None
+        c0  = n_a * c_a + n_b * c_b
+        phi = math.atan2(n_b, n_a)
+        u   = (p - c0) / r                    # cos(t - phi) >= u keeps the + side
+        if keep > 0:
+            if u <= -1.0:
+                return (0.0, 2.0 * math.pi)
+            if u >= 1.0:
+                return None
+            t = math.acos(u)
+            return (phi - t, phi + t)
+        if u >= 1.0:
+            return (0.0, 2.0 * math.pi)
+        if u <= -1.0:
+            return None
+        t = math.acos(u)
+        return (phi + t, phi + 2.0 * math.pi - t)
+
+    def _span(self, lo, hi, axis):
+        """Truncate the interval [lo, hi] along `axis` to the kept half-space."""
+        if self.cut_axis != axis:
+            return (lo, hi)
+        if self.cut_keep > 0:
+            lo = max(lo, self.cut_pos)
+        else:
+            hi = min(hi, self.cut_pos)
+        return (lo, hi) if hi > lo else None
+
+    def visible(self, x, y, z):
+        """Is this point on the kept side of the cut plane?"""
+        if self.cut_axis is None:
+            return True
+        c = x if self.cut_axis == "x" else (y if self.cut_axis == "y" else z)
+        return self.cut_keep * (c - self.cut_pos) >= 0.0
+
+    def _ring_arc(self, cx0, cy0, r):
+        """Kept angular range of a z-axis circle under an x or y cut."""
+        if self.cut_axis == "x":
+            return self._arc(cx0, cy0, r, 1.0, 0.0, self.cut_pos, self.cut_keep)
+        if self.cut_axis == "y":
+            return self._arc(cx0, cy0, r, 0.0, 1.0, self.cut_pos, self.cut_keep)
+        return (0.0, 2.0 * math.pi)
+
+    # ── tracks ───────────────────────────────────────────────────────────
+    def pl3(self, xs, ys, zs, color, width=1, alpha=1.0):
+        self._line(xs, ys, zs, color, width, alpha)
+
+    def clip_track(self, xs, ys, zs):
+        """Contiguous sub-segments inside the visible cube and, with a cut
+        active, on its kept side.  Point-mask only — no exact boundary
+        intersection — but it keeps ROOT from projecting far outside the frame.
+        """
+        hr = self.hr
+        mask = ((xs >= self.cx - hr) & (xs <= self.cx + hr) &
+                (ys >= self.cy - hr) & (ys <= self.cy + hr) &
+                (zs >= self.cz - hr) & (zs <= self.cz + hr))
+        if self.cut_axis is not None:
+            c = {"x": xs, "y": ys, "z": zs}[self.cut_axis]
+            mask = mask & (self.cut_keep * (c - self.cut_pos) >= 0.0)
+        segs, i, n = [], 0, len(xs)
+        while i < n:
+            if mask[i]:
+                j = i + 1
+                while j < n and mask[j]:
+                    j += 1
+                if j - i >= 2:
+                    segs.append((xs[i:j], ys[i:j], zs[i:j]))
+                i = j
+            else:
+                i += 1
+        return segs
+
+    # ── geometry ─────────────────────────────────────────────────────────
+    def draw_plane_z(self, z, color, width=2, style=1, alpha=1.0):
+        """Rectangle in x-y at constant z, clipped to the view and the cut.
+
+        A plane has no thickness, so a z-cut can only cull it; x and y cuts
+        clip one bound exactly.
+        """
+        if z is None or not (self.cz - self.hr <= z <= self.cz + self.hr):
+            return
+        if self.cut_axis == "z" and not self.visible(0.0, 0.0, z):
+            return
+        xr = self._span(self.cx - self.hr, self.cx + self.hr, "x")
+        yr = self._span(self.cy - self.hr, self.cy + self.hr, "y")
+        if xr is None or yr is None:
+            return
+        x0, x1 = xr
+        y0, y1 = yr
+        self._line([x0, x1, x1, x0, x0], [y0, y0, y1, y1, y0],
+                   [z] * 5, color, width, alpha, style)
+
+    def draw_cylinder(self, cx0, cy0, z0, z1, r_cm, color, alpha=1.0,
+                      n_sides=None, style=1):
+        """Wireframe cylinder (a hole or aperture) between z0 and z1.
+
+        A z-cut truncates the span; an x or y cut restricts the rings to one
+        arc.  Facet density is held constant per unit angle, so a 30-degree
+        sliver is not drawn with a full ring's worth of lines, and both arc-end
+        longitudinals are always drawn so a section reads as a cut rather than
+        as a thinner tube.
+        """
+        span = self._span(min(z0, z1), max(z0, z1), "z")
+        if span is None:
+            return
+        z0, z1 = span
+        rng = self._ring_arc(cx0, cy0, r_cm)
+        if rng is None:
+            return
+        t0, t1 = rng
+        full = (t1 - t0) >= 2.0 * math.pi - 1e-9
+        # n_sides carries the polygon order neBEM actually meshed, but it is
+        # still capped by the reduction ladder's facet budget: a degraded draw
+        # is allowed to be coarser than the solved polygon, and says so.
+        n    = self.s_cyl if n_sides is None else min(max(3, int(n_sides)), self.s_cyl)
+        na   = max(2, int(round(n * (t1 - t0) / (2.0 * math.pi))))
+        ang  = np.linspace(t0, t1, na + 1)
+        xs   = cx0 + r_cm * np.cos(ang)
+        ys   = cy0 + r_cm * np.sin(ang)
+        for zc in (z0, z1):                       # end rings / cut caps
+            self._line(xs, ys, np.full(ang.size, zc), color, 1, alpha, style)
+        idx = set(range(0, na, 2))                # every other longitudinal
+        if not full:
+            idx |= {0, na}                        # ... plus both cut edges
+        for i in sorted(idx):
+            self._line([xs[i], xs[i]], [ys[i], ys[i]], [z0, z1],
+                       color, 1, alpha, style)
+
+    def draw_wire(self, axis, c_a, c_b, rad, color, alpha=1.0,
+                  n_sides=None, style=1):
+        """Wire of radius `rad` running along `axis` ("x" or "y") across the view.
+
+        (c_a, c_b) is the axis position in the cross-section plane: (x, z) for a
+        wire along y, (y, z) for one along x.  A cut along the wire's own axis
+        shortens it; a cut in its cross-section plane arc-restricts the facets.
+        """
+        if axis == "y":
+            lo, hi = self.cy - self.hr, self.cy + self.hr
+            n_ab = ((1.0, 0.0) if self.cut_axis == "x" else
+                    (0.0, 1.0) if self.cut_axis == "z" else (0.0, 0.0))
+        else:
+            lo, hi = self.cx - self.hr, self.cx + self.hr
+            n_ab = ((1.0, 0.0) if self.cut_axis == "y" else
+                    (0.0, 1.0) if self.cut_axis == "z" else (0.0, 0.0))
+        span = self._span(lo, hi, axis)
+        if span is None:
+            return                                  # the cut removed the wire
+        lo, hi = span
+        if n_ab == (0.0, 0.0):
+            t0, t1 = 0.0, 2.0 * math.pi
+        else:
+            rng = self._arc(c_a, c_b, rad, n_ab[0], n_ab[1],
+                            self.cut_pos, self.cut_keep)
+            if rng is None:
+                return
+            t0, t1 = rng
+        n    = self.s_wire if n_sides is None else max(1, int(n_sides))
+        full = (t1 - t0) >= 2.0 * math.pi - 1e-9
+        if n <= 1:
+            # Degraded rung of the reduction ladder: a bare centre-line.
+            pts = [(c_a, c_b)]
+        else:
+            na  = max(1, int(round(n * (t1 - t0) / (2.0 * math.pi))))
+            ang = (np.linspace(t0, t1, na, endpoint=False) if full
+                   else np.linspace(t0, t1, max(2, na + 1)))
+            pts = [(c_a + rad * math.cos(t), c_b + rad * math.sin(t)) for t in ang]
+        for a, b in pts:
+            if axis == "y":
+                self._line([a, a], [lo, hi], [b, b], color, 1, alpha, style)
+            else:
+                self._line([lo, hi], [a, a], [b, b], color, 1, alpha, style)
+
+    def draw_wire_y(self, cx0, zc, rad, color, alpha=1.0, n_sides=None):
+        self.draw_wire("y", cx0, zc, rad, color, alpha, n_sides)
+
+    def draw_wire_x(self, cy0, zc, rad, color, alpha=1.0, n_sides=None):
+        self.draw_wire("x", cy0, zc, rad, color, alpha, n_sides)
+
+    def draw_plate(self, pg, hole_xs, color, split=False,
+                   col_cu_top=None, col_cu_bot=None):
+        """The THGEM: its two copper faces plus a block of hole barrels.
+
+        split=False draws one barrel at the dielectric hole radius, which is
+        what the 3D Tracks tab has always done.  split=True draws the three
+        real z-segments — copper at r_cu_cm above and below, dielectric bore at
+        r_hole_cm between — so an etched rim (100 um in the shipped default) is
+        visible instead of being averaged away.
+        """
+        z_t, z_b = pg.get("z_top_cu_top_cm"), pg.get("z_bot_cu_bot_cm")
+        if z_t is None or z_b is None:
+            return
+        r_h  = pg.get("r_hole_cm", 0.02)
+        r_cu = pg.get("r_cu_cm", r_h)
+        zc   = pg.get("z_cen_cm", 0.5 * (z_t + z_b))
+        zdh  = pg.get("z_diel_half_cm", 0.0)
+        # SolidHole meshes a 4(n-1)-gon, so draw the polygon that was solved.
+        ns   = 4 * (max(2, int(pg.get("sectors", 4))) - 1)
+        ct   = color if col_cu_top is None else col_cu_top
+        cb   = color if col_cu_bot is None else col_cu_bot
+        self.draw_plane_z(z_t, ct, 1)
+        self.draw_plane_z(z_b, cb, 1)
+        if not (self.cz - self.hr <= z_t and z_b <= self.cz + self.hr):
+            return
+        for i in self.tile_range():
+            for xh in hole_xs:
+                x0 = xh + i * self.cell_x
+                for j in self.tile_range():
+                    y0 = j * self.pitch
+                    if split and zdh > 0.0:
+                        self.draw_cylinder(x0, y0, zc + zdh, z_t, r_cu, ct, 0.55, ns)
+                        self.draw_cylinder(x0, y0, zc - zdh, zc + zdh, r_h, color, 0.55, ns)
+                        self.draw_cylinder(x0, y0, z_b, zc - zdh, r_cu, cb, 0.55, ns)
+                    else:
+                        self.draw_cylinder(x0, y0, z_b, z_t, r_h, color, 0.55, ns)
+
+    def draw_mesh(self, mg, col_lower, col_upper=None, style_lower=1,
+                  style_upper=1, plane_color=None):
+        """The mesh: its two bounding planes plus wire layers or aperture barrels.
+
+        The two woven layers are one conductor at one potential; drawing them in
+        two colours is a display distinction (which layer is which), not two
+        electrodes.  Layer convention follows the C++: upper wires run along x
+        and are indexed by wire_y_cm at z_upper_cm; lower wires run along y and
+        are indexed by wire_x_cm at z_lower_cm.
+        """
+        col_upper = col_lower if col_upper is None else col_upper
+        z_t, z_b = mg.get("z_top_cm"), mg.get("z_bot_cm")
+        if z_t is None or z_b is None:
+            return
+        pc = col_lower if plane_color is None else plane_color
+        self.draw_plane_z(z_t, pc, 1)
+        self.draw_plane_z(z_b, pc, 1)
+        if not (self.cz - self.hr <= z_t and z_b <= self.cz + self.hr):
+            return
+        if mg.get("model") == "woven":
+            r    = mg.get("r_wire_cm", 25e-4)
+            z_lo = mg.get("z_lower_cm", z_b)
+            z_up = mg.get("z_upper_cm", z_t)
+            for i in self.tile_range():
+                for xw in mg.get("wire_x_cm", []):
+                    self.draw_wire("y", xw + i * self.cell_x, z_lo, r,
+                                   col_lower, 0.8, style=style_lower)
+                for yw in mg.get("wire_y_cm", []):
+                    self.draw_wire("x", yw + i * self.cell_y, z_up, r,
+                                   col_upper, 0.8, style=style_upper)
+        else:
+            r_a = mg.get("r_aperture_cm", 0.01)
+            ns  = 4 * (max(2, int(mg.get("sectors", 4))) - 1)
+            for i in self.tile_range():
+                for j in self.tile_range():
+                    for xa in mg.get("wire_x_cm", []):
+                        for ya in mg.get("wire_y_cm", []):
+                            self.draw_cylinder(xa + i * self.cell_x,
+                                               ya + j * self.cell_y,
+                                               z_b, z_t, r_a, col_lower,
+                                               0.55, ns)
+
+    def draw_cell_box(self, z0, z1, color, width=3, style=1):
+        """The neBEM unit cell: cell_x x cell_y, z_min -> z_max.
+
+        This is the volume that was actually solved; everything else on screen
+        is a periodic display copy of it.
+        """
+        hx, hy = 0.5 * self.cell_x, 0.5 * self.cell_y
+        xr = self._span(-hx, hx, "x")
+        yr = self._span(-hy, hy, "y")
+        zr = self._span(min(z0, z1), max(z0, z1), "z")
+        if xr is None or yr is None or zr is None:
+            return
+        x0, x1 = xr
+        y0, y1 = yr
+        z0, z1 = zr
+        for z in (z0, z1):
+            self._line([x0, x1, x1, x0, x0], [y0, y0, y1, y1, y0],
+                       [z] * 5, color, width, style=style)
+        for xc, yc in ((x0, y0), (x1, y0), (x1, y1), (x0, y1)):
+            self._line([xc, xc], [yc, yc], [z0, z1], color, width, style=style)
+
+    def draw_copy_footprints(self, z0, z1, color, style=3, width=1):
+        """Footprints of the tiled display copies at the two z faces.
+
+        Thin, dotted and footprint-only against the solved cell's solid, heavy,
+        full box — three cues at once, so no rotation makes them confusable.
+        """
+        hx, hy = 0.5 * self.cell_x, 0.5 * self.cell_y
+        zr = self._span(min(z0, z1), max(z0, z1), "z")
+        if zr is None:
+            return
+        for i in self.tile_range():
+            for j in self.tile_range():
+                if i == 0 and j == 0:
+                    continue
+                xr = self._span(i * self.cell_x - hx, i * self.cell_x + hx, "x")
+                yr = self._span(j * self.cell_y - hy, j * self.cell_y + hy, "y")
+                if xr is None or yr is None:
+                    continue
+                x0, x1 = xr
+                y0, y1 = yr
+                for z in zr:
+                    self._line([x0, x1, x1, x0, x0], [y0, y0, y1, y1, y0],
+                               [z] * 5, color, width, style=style)
+
+    def draw_cut_plane(self, color, style=7):
+        """Dashed outline of the cut plane itself, as a datum for the section."""
+        if self.cut_axis is None:
+            return
+        hr, p = self.hr, self.cut_pos
+        a0, a1 = self.cx - hr, self.cx + hr
+        b0, b1 = self.cy - hr, self.cy + hr
+        c0, c1 = self.cz - hr, self.cz + hr
+        if self.cut_axis == "x":
+            self._line([p] * 5, [b0, b1, b1, b0, b0], [c0, c0, c1, c1, c0],
+                       color, 1, 1.0, style)
+        elif self.cut_axis == "y":
+            self._line([a0, a1, a1, a0, a0], [p] * 5, [c0, c0, c1, c1, c0],
+                       color, 1, 1.0, style)
+        else:
+            self._line([a0, a1, a1, a0, a0], [b0, b0, b1, b1, b0], [p] * 5,
+                       color, 1, 1.0, style)
+
+    # ── cost model ───────────────────────────────────────────────────────
+    @staticmethod
+    def estimate_objects(dv, n, s_cyl, s_wire, split_plate=True, copies=True):
+        """Primitives one draw pass would emit, without drawing anything.
+
+        The scaling is asymmetric and worth knowing: a woven mesh costs
+        O(n*k) because its wires span the view and tile in one index only,
+        while a perforated one costs O(n^2 * k^2) because every aperture is its
+        own barrel.  That is why a fine perforated mesh is what blows the budget.
+        """
+        mesh    = dv.get("mesh") or {}
+        plate   = dv.get("thgem") or {}
+        holes   = len(dv.get("hole_x_thgem_cm") or [0.0])
+
+        def _per_cyl(sectors):
+            # draw_cylinder emits 2 rings + every other longitudinal, at the
+            # solved polygon order capped by the ladder's facet budget.
+            ns = min(4 * (max(2, int(sectors)) - 1), max(3, s_cyl))
+            return 2 + (ns + 1) // 2
+
+        pc_plate = _per_cyl(plate.get("sectors", 4))
+        total  = 6                                     # bounding + face planes
+        total += n * max(1, s_wire)                    # cathode wires
+        total += n * holes * n * (3 if split_plate else 1) * pc_plate
+        if mesh.get("model") == "woven":
+            total += n * (len(mesh.get("wire_x_cm") or []) +
+                          len(mesh.get("wire_y_cm") or [])) * max(1, s_wire)
+        else:
+            total += (n * n * len(mesh.get("wire_x_cm") or []) *
+                      len(mesh.get("wire_y_cm") or [])) * _per_cyl(
+                          mesh.get("sectors", 4))
+        total += 16 + (n * n - 1) * 2 * bool(copies)   # cell box + footprints
+        return total
+
+
+# ---------------------------------------------------------------------------
 # Results panel (right side)
 # ---------------------------------------------------------------------------
 
@@ -1402,6 +1904,27 @@ class ResultsPanel(QTabWidget):
         self._trk_n_holes:    int   = 4     # N×N block of holes drawn in the 3D view
         self._trk_n_aval_paths: int = 50    # avalanche e⁻ drift lines drawn (0 = hide)
         self._map_n_holes:    int   = 4     # holes tiled across the E/W field maps in x
+        # — Geometry tab —
+        self._geo_canvas  = None            # ROOT TCanvas for the geometry view
+        self._geo_objects: list = []        # TPolyLine3D / TLatex keep-alive
+        self._geo_legend_objects: list = []
+        self._geo_cfg:  dict | None = None  # the whole run_config.json on display
+        self._geo_geom: dict | None = None  # ... and its "derived" block
+        self._geo_run_label: str = ""
+        self._geo_last_run_dir: str = ""    # for the "Use last run" button
+        self._geo_zoom_scale: float = 1.0
+        self._geo_view_phi:   float = 32.0
+        self._geo_view_theta: float = 30.0
+        self._geo_pan_x = self._geo_pan_y = self._geo_pan_z = 0.0
+        self._geo_n_holes:  int = 3         # NxN display copies of the solved cell
+        self._geo_last_n_obj: int = 0       # geometry primitives in the last draw
+        self._geo_cut_axis: str | None = None
+        self._geo_cut_frac: float = 0.5     # slider position, 0..1 of the extent
+        self._geo_cut_pos:  float = 0.0     # cm, derived from _geo_cut_frac
+        self._geo_cut_keep: int = -1        # -1 keeps the low side
+        self._geo_show_cell   = True
+        self._geo_show_copies = True
+        self._geo_show_labels = True
         self._efield_cache: dict | None = None   # {x, y, Ex, Ey} computed arrays
         self._efield_root_canvas  = None   # ROOT TCanvas for E-field maps
         self._efield_objects: list = []
@@ -1544,6 +2067,175 @@ class ResultsPanel(QTabWidget):
         self.charge_event_slider.valueChanged.connect(self._update_charge_plot)
 
         self.addTab(charge_widget, "Integrals")
+
+        # ── Geometry tab ──────────────────────────────────────────────────────
+        # The resolved stack on its own, from a run's run_config.json.  Unlike
+        # 3D Tracks this needs no transported events, and it can open a run from
+        # any earlier session — geometry is the one thing worth looking at
+        # without waiting for a solve.
+        geo_widget = QWidget()
+        geo_layout = QVBoxLayout(geo_widget)
+        geo_layout.setContentsMargins(8, 6, 8, 6)
+        geo_layout.setSpacing(6)
+
+        # — source row —
+        geo_src_row = QWidget()
+        geo_src_h   = QHBoxLayout(geo_src_row)
+        geo_src_h.setContentsMargins(0, 0, 0, 0)
+        geo_load_btn = QPushButton("Load run …")
+        geo_load_btn.setMaximumWidth(90)
+        geo_load_btn.setToolTip(
+            "Open any run directory and read its run_config.json.\n"
+            "Geometry comes from the binary's own \"derived\" block, so what you "
+            "see is what was solved.")
+        geo_load_btn.clicked.connect(self._on_geo_load_run)
+        geo_src_h.addWidget(geo_load_btn)
+        self.geo_last_btn = QPushButton("Use last run")
+        self.geo_last_btn.setMaximumWidth(95)
+        self.geo_last_btn.setEnabled(False)
+        self.geo_last_btn.clicked.connect(self._on_geo_use_last_run)
+        geo_src_h.addWidget(self.geo_last_btn)
+        geo_src_h.addSpacing(12)
+        self.geo_source_label = QLabel("no run loaded")
+        self.geo_source_label.setStyleSheet("color: grey; font-size: 11px;")
+        geo_src_h.addWidget(self.geo_source_label)
+        geo_src_h.addStretch()
+        geo_layout.addWidget(geo_src_row)
+
+        # — view controls —
+        geo_view_row = QWidget()
+        geo_view_h   = QHBoxLayout(geo_view_row)
+        geo_view_h.setContentsMargins(0, 0, 0, 0)
+        for _label, _phi, _theta, _rz in [
+            ("Gap XY",  0,  90, False),
+            ("Top XZ",  0,   0, False),
+            ("Side YZ", 90,  0, False),
+            ("3D",      32, 30, True),
+        ]:
+            _btn = QPushButton(_label)
+            _btn.setMaximumWidth(72)
+            _btn.clicked.connect(
+                (lambda p, t, rz: lambda: self._geo_preset_view(p, t, rz))
+                (_phi, _theta, _rz))
+            geo_view_h.addWidget(_btn)
+        geo_view_h.addSpacing(16)
+        geo_zin  = QPushButton("Zoom +")
+        geo_zout = QPushButton("Zoom −")
+        geo_zin.setMaximumWidth(65)
+        geo_zout.setMaximumWidth(65)
+        geo_zin.clicked.connect(lambda: self._geo_adjust_zoom(0.7))
+        geo_zout.clicked.connect(lambda: self._geo_adjust_zoom(1.0 / 0.7))
+        geo_view_h.addWidget(geo_zin)
+        geo_view_h.addWidget(geo_zout)
+        geo_view_h.addSpacing(16)
+        geo_view_h.addWidget(QLabel("Cells:"))
+        self.geo_cells_spin = QSpinBox()
+        self.geo_cells_spin.setRange(1, 15)
+        self.geo_cells_spin.setValue(self._geo_n_holes)
+        self.geo_cells_spin.setMaximumWidth(52)
+        self.geo_cells_spin.setToolTip(
+            "N×N display copies of the periodic cell.\n"
+            "Only the centre one was solved; the rest are the tiling neBEM "
+            "applies, drawn so\nyou can see how the lattices line up. Raising it "
+            "may trip the primitive budget,\nwhich coarsens the drawing and says "
+            "so below.")
+        self.geo_cells_spin.valueChanged.connect(self._on_geo_cells_changed)
+        geo_view_h.addWidget(self.geo_cells_spin)
+        geo_view_h.addStretch()
+        geo_layout.addWidget(geo_view_row)
+
+        # — overlay toggles —
+        geo_ovl_row = QWidget()
+        geo_ovl_h   = QHBoxLayout(geo_ovl_row)
+        geo_ovl_h.setContentsMargins(0, 0, 0, 0)
+        self.geo_cb_cell = QCheckBox("neBEM cell")
+        self.geo_cb_cell.setChecked(True)
+        self.geo_cb_cell.setToolTip(
+            "The one cell that was actually solved (solid, heavy, magenta).")
+        self.geo_cb_copies = QCheckBox("tiled copies")
+        self.geo_cb_copies.setChecked(True)
+        self.geo_cb_copies.setToolTip(
+            "Footprints of the display copies (dotted, thin, grey) — the tiling "
+            "lattice, not solved geometry.")
+        self.geo_cb_labels = QCheckBox("dimension labels")
+        self.geo_cb_labels.setChecked(True)
+        self.geo_cb_labels.setToolTip(
+            "Annotation column: every z plane, potential, gap field, the mesh "
+            "lattice and the two transport-grid budgets.")
+        for _cb, _attr in ((self.geo_cb_cell, "_geo_show_cell"),
+                           (self.geo_cb_copies, "_geo_show_copies"),
+                           (self.geo_cb_labels, "_geo_show_labels")):
+            _cb.toggled.connect(
+                (lambda a: lambda on: self._on_geo_toggle(a, on))(_attr))
+            geo_ovl_h.addWidget(_cb)
+        geo_ovl_h.addStretch()
+        geo_layout.addWidget(geo_ovl_row)
+
+        # — cut-away —
+        geo_cut_row = QWidget()
+        geo_cut_h   = QHBoxLayout(geo_cut_row)
+        geo_cut_h.setContentsMargins(0, 0, 0, 0)
+        geo_cut_h.addWidget(QLabel("Cut:"))
+        self.geo_cut_combo = QComboBox()
+        self.geo_cut_combo.addItems(["off", "x", "y", "z"])
+        self.geo_cut_combo.setMaximumWidth(64)
+        self.geo_cut_combo.currentIndexChanged.connect(self._on_geo_cut_axis_changed)
+        geo_cut_h.addWidget(self.geo_cut_combo)
+        self.geo_cut_slider = QSlider(Qt.Horizontal)
+        self.geo_cut_slider.setRange(0, 1000)
+        self.geo_cut_slider.setValue(500)
+        self.geo_cut_slider.setEnabled(False)
+        self.geo_cut_slider.valueChanged.connect(self._on_geo_cut_moved)
+        geo_cut_h.addWidget(self.geo_cut_slider)
+        self.geo_cut_label = QLabel("—")
+        self.geo_cut_label.setMinimumWidth(110)
+        self.geo_cut_label.setStyleSheet("color: grey; font-size: 11px;")
+        geo_cut_h.addWidget(self.geo_cut_label)
+        self.geo_flip_btn = QPushButton("Flip side")
+        self.geo_flip_btn.setMaximumWidth(78)
+        self.geo_flip_btn.setEnabled(False)
+        self.geo_flip_btn.clicked.connect(self._on_geo_flip_cut)
+        geo_cut_h.addWidget(self.geo_flip_btn)
+        geo_cut_h.addStretch()
+        geo_layout.addWidget(geo_cut_row)
+
+        # — pan —
+        geo_pan_row = QWidget()
+        geo_pan_h   = QHBoxLayout(geo_pan_row)
+        geo_pan_h.setContentsMargins(0, 0, 0, 0)
+        geo_pan_h.addWidget(QLabel("Pan:"))
+        for _ax, _d, _lbl in [
+            ("x", -1, "X-"), ("x", +1, "X+"),
+            ("y", -1, "Y-"), ("y", +1, "Y+"),
+            ("z", -1, "Z-"), ("z", +1, "Z+"),
+        ]:
+            _btn = QPushButton(_lbl)
+            _btn.setMaximumWidth(42)
+            _btn.clicked.connect((lambda a, d: lambda: self._geo_pan(a, d))(_ax, _d))
+            geo_pan_h.addWidget(_btn)
+        geo_pan_h.addStretch()
+        geo_layout.addWidget(geo_pan_row)
+
+        self.geo_status = QLabel("")
+        self.geo_status.setWordWrap(True)
+        self.geo_status.setStyleSheet("color: grey; font-size: 11px;")
+        geo_layout.addWidget(self.geo_status)
+
+        geo_hint = QLabel(
+            "The resolved stack, drawn from the run's own \"derived\" block. "
+            "Left-drag in the ROOT window to rotate; right-click to save.\n"
+            "The cut is a display filter over wireframe outlines: it removes "
+            "geometry on one side of an axis-aligned plane, but it does not cap "
+            "the section into a solid face, and ROOT's 3D painter does not "
+            "depth-sort — so the far half of what remains still draws over the "
+            "near half."
+        )
+        geo_hint.setWordWrap(True)
+        geo_hint.setStyleSheet("color: grey; font-size: 11px;")
+        geo_layout.addWidget(geo_hint)
+        geo_layout.addStretch()
+
+        self._tab_geometry = self.addTab(geo_widget, "Geometry")
 
         # ── 3D Tracks tab ─────────────────────────────────────────────────────
         tracks_widget = QWidget()
@@ -1814,6 +2506,11 @@ class ResultsPanel(QTabWidget):
         self.gas_export_csv_btn.clicked.connect(self._on_gas_export_csv)
 
         self.addTab(gas_widget, "Magboltz")
+
+        # Draw the geometry the first time its tab is shown, rather than when a
+        # run finishes — a finished run should not throw a second ROOT window in
+        # front of whatever the user is looking at.
+        self.currentChanged.connect(self._on_tab_changed)
 
         # — timer to keep ROOT canvas responsive —
         self._root_timer = QTimer(self)
@@ -2142,6 +2839,7 @@ class ResultsPanel(QTabWidget):
                 (self._gas_canvas,         "magboltz"),
                 (self._efield_root_canvas, "efield"),
                 (self._wfield_root_canvas, "wfield"),
+                (self._geo_canvas,         "geometry"),
             ]:
                 if canvas is None:        # closed canvases have a None ref
                     continue
@@ -2877,17 +3575,21 @@ class ResultsPanel(QTabWidget):
             self._tracks_canvas.SetTheta(self._trk_view_theta)
 
             # TH3F frame — defines axes and 3D coordinate range
+            # vx/vy/vz, not px/py/pz: those names are rebound below to the
+            # primary track's coordinate arrays, and the geometry/clipping code
+            # used to read them at call time — clipping the avalanche and ion
+            # drift lines against the primary track instead of the view cube.
             s  = self._trk_zoom_scale
-            px = self._trk_pan_x
-            py = self._trk_pan_y
-            pz = z_centre + self._trk_pan_z
+            vx = self._trk_pan_x
+            vy = self._trk_pan_y
+            vz = z_centre + self._trk_pan_z
             frame = ROOT.TH3F(
                 "trk_frame",
                 f"THGEM + mesh 3D Tracks - {label}, event {ev + 1};"
                 "x [cm];y [cm];z [cm]",
-                1, px - max_half * s, px + max_half * s,
-                1, py - max_half * s, py + max_half * s,
-                1, pz - max_half * s, pz + max_half * s,
+                1, vx - max_half * s, vx + max_half * s,
+                1, vy - max_half * s, vy + max_half * s,
+                1, vz - max_half * s, vz + max_half * s,
             )
             frame.SetStats(0)
             # Dynamic margins: make the inner pad area square so ROOT maps the
@@ -2909,179 +3611,26 @@ class ResultsPanel(QTabWidget):
             frame.Draw()
             self._tracks_objects.append(frame)
 
-            def _clip(xs, ys, zs):
-                """Return contiguous sub-segments whose points lie within the
-                visible cube [centre ± max_half*s].  Point-mask only — no exact
-                boundary intersection, but avoids drawing far outside the frame."""
-                hr = max_half * s
-                cx_ = px
-                cy_ = py
-                cz_ = pz
-                mask = ((xs >= cx_ - hr) & (xs <= cx_ + hr) &
-                        (ys >= cy_ - hr) & (ys <= cy_ + hr) &
-                        (zs >= cz_ - hr) & (zs <= cz_ + hr))
-                segs, i, n = [], 0, len(xs)
-                while i < n:
-                    if mask[i]:
-                        j = i + 1
-                        while j < n and mask[j]:
-                            j += 1
-                        if j - i >= 2:
-                            segs.append((xs[i:j], ys[i:j], zs[i:j]))
-                        i = j
-                    else:
-                        i += 1
-                return segs
-
-            def _pl3(xs, ys, zs, color, width=1, alpha=1.0):
-                ln = ROOT.TPolyLine3D(
-                    len(xs), xs.astype("f4"), ys.astype("f4"), zs.astype("f4"))
-                if alpha < 1.0:
-                    ln.SetLineColorAlpha(color, alpha)
-                else:
-                    ln.SetLineColor(color)
-                ln.SetLineWidth(width)
-                ln.Draw("SAME")
-                self._tracks_objects.append(ln)
-
-            # ── Stack geometry (electrode planes, plates, wires) ───────────────
-            _hr = max_half * s   # visible half-range (cube half-size at this zoom)
-
-            def _draw_plane_z(z, color, width=2):
-                """Rectangle in the x,y plane at constant z, clipped to the view."""
-                if z is None or not (pz - _hr <= z <= pz + _hr):
-                    return
-                x0, x1 = px - _hr, px + _hr
-                y0, y1 = py - _hr, py + _hr
-                xs = np.array([x0, x1, x1, x0, x0], "f4")
-                ys = np.array([y0, y0, y1, y1, y0], "f4")
-                zs = np.full(5, z, "f4")
-                pl = ROOT.TPolyLine3D(5, xs, ys, zs)
-                pl.SetLineColor(color)
-                pl.SetLineWidth(width)
-                pl.Draw("SAME")
-                self._tracks_objects.append(pl)
-
-            def _draw_cylinder(cx, cy, z0, z1, r_cm, color, alpha, n_sides=12):
-                """Wireframe cylinder (a hole) of radius r_cm between z0 and z1."""
-                ang = np.linspace(0.0, 2.0 * np.pi, n_sides + 1)
-                xs = (cx + r_cm * np.cos(ang)).astype("f4")
-                ys = (cy + r_cm * np.sin(ang)).astype("f4")
-                for zc in (z0, z1):                       # top and bottom rings
-                    zs = np.full(n_sides + 1, zc, "f4")
-                    ring = ROOT.TPolyLine3D(n_sides + 1, xs, ys, zs)
-                    ring.SetLineColorAlpha(color, alpha)
-                    ring.SetLineWidth(1)
-                    ring.Draw("SAME")
-                    self._tracks_objects.append(ring)
-                for a in ang[:-1:2]:                      # every other longitudinal edge
-                    xe = float(cx + r_cm * np.cos(a))
-                    ye = float(cy + r_cm * np.sin(a))
-                    ln = ROOT.TPolyLine3D(
-                        2, np.array([xe, xe], "f4"), np.array([ye, ye], "f4"),
-                        np.array([z0, z1], "f4"))
-                    ln.SetLineColorAlpha(color, alpha)
-                    ln.SetLineWidth(1)
-                    ln.Draw("SAME")
-                    self._tracks_objects.append(ln)
-
-            def _draw_wire_y(cx, zc, rad, color, alpha, n_sides=8):
-                """A wire running along y across the view (cathode, or mesh layer)."""
-                y0, y1 = py - _hr, py + _hr
-                ang = np.linspace(0.0, 2.0 * np.pi, n_sides + 1)
-                for a in ang[:-1]:
-                    xe = float(cx + rad * np.cos(a))
-                    ze = float(zc + rad * np.sin(a))
-                    ln = ROOT.TPolyLine3D(
-                        2, np.array([xe, xe], "f4"), np.array([y0, y1], "f4"),
-                        np.array([ze, ze], "f4"))
-                    ln.SetLineColorAlpha(color, alpha)
-                    ln.SetLineWidth(1)
-                    ln.Draw("SAME")
-                    self._tracks_objects.append(ln)
-
-            def _draw_wire_x(cy, zc, rad, color, alpha, n_sides=8):
-                """The mirror of _draw_wire_y: a wire running along x."""
-                x0, x1 = px - _hr, px + _hr
-                ang = np.linspace(0.0, 2.0 * np.pi, n_sides + 1)
-                for a in ang[:-1]:
-                    ye = float(cy + rad * np.cos(a))
-                    ze = float(zc + rad * np.sin(a))
-                    ln = ROOT.TPolyLine3D(
-                        2, np.array([x0, x1], "f4"), np.array([ye, ye], "f4"),
-                        np.array([ze, ze], "f4"))
-                    ln.SetLineColorAlpha(color, alpha)
-                    ln.SetLineWidth(1)
-                    ln.Draw("SAME")
-                    self._tracks_objects.append(ln)
-
-            def _draw_mesh(mg, color):
-                """The mesh: its two bounding planes plus the wires or apertures."""
-                z_t = mg.get("z_top_cm")
-                z_b = mg.get("z_bot_cm")
-                if z_t is None or z_b is None:
-                    return
-                _draw_plane_z(z_t, ROOT.kGreen + 1, 1)
-                _draw_plane_z(z_b, ROOT.kGreen + 1, 1)
-                if not (pz - _hr <= z_t and z_b <= pz + _hr):
-                    return
-                n = max(1, int(self._trk_n_holes))
-                half = n // 2
-                if mg.get("model") == "woven":
-                    r = mg.get("r_wire_cm", 25e-4)
-                    for i in range(-half, n - half):
-                        for xw in mg.get("wire_x_cm", []):
-                            _draw_wire_y(xw + i * cell_x, mg.get("z_lower_cm", z_b),
-                                         r, color, 0.8)
-                        for yw in mg.get("wire_y_cm", []):
-                            _draw_wire_x(yw + i * cell_y, mg.get("z_upper_cm", z_t),
-                                         r, color, 0.8)
-                else:
-                    r_a = mg.get("r_aperture_cm", 0.01)
-                    for i in range(-half, n - half):
-                        for j in range(-half, n - half):
-                            for xa in mg.get("wire_x_cm", []):
-                                for ya in mg.get("wire_y_cm", []):
-                                    _draw_cylinder(xa + i * cell_x, ya + j * cell_y,
-                                                   z_b, z_t, r_a, color, 0.55)
-
-            def _draw_plate(pg, hole_xs, color):
-                """The THGEM: its two copper faces plus a block of hole cylinders."""
-                z_t = pg.get("z_top_cu_top_cm")
-                z_b = pg.get("z_bot_cu_bot_cm")
-                r_h = pg.get("r_hole_cm", 0.02)
-                if z_t is None or z_b is None:
-                    return
-                _draw_plane_z(z_t, ROOT.kGray + 2, 1)
-                _draw_plane_z(z_b, ROOT.kGray + 2, 1)
-                if not (pz - _hr <= z_t and z_b <= pz + _hr):
-                    return
-                # Tile the cell's own hole columns outward, so a staggered plate
-                # keeps its true x positions rather than being redrawn on a
-                # generic lattice.
-                n = max(1, int(self._trk_n_holes))
-                half = n // 2
-                for i in range(-half, n - half):
-                    for xh in hole_xs:
-                        cx = xh + i * cell_x
-                        for j in range(-half, n - half):
-                            _draw_cylinder(cx, j * pitch, z_b, z_t, r_h, color, 0.55)
+            # The wireframe drawers live on _GeoView, shared with the Geometry
+            # tab.  budget=0: the tracks tab draws whatever the geometry needs,
+            # with no reduction ladder.
+            view = _GeoView(ROOT, self._tracks_objects, (vx, vy, vz),
+                            max_half * s, cell_x, cell_y, pitch,
+                            n_holes=self._trk_n_holes)
 
             # Bounding electrode planes.
-            _draw_plane_z(z_wire,  ROOT.kCyan - 7)    # wire-cathode plane (top)
+            view.draw_plane_z(z_wire,  ROOT.kCyan - 7)   # wire-cathode plane (top)
             if z_anode is not None:
-                _draw_plane_z(z_anode, ROOT.kRed - 7)  # anode pad (bottom)
+                view.draw_plane_z(z_anode, ROOT.kRed - 7)  # anode pad (bottom)
 
             # The wire cathode itself: one wire per cell, running along y.
-            if z_wire is not None and pz - _hr <= z_wire <= pz + _hr:
-                n = max(1, int(self._trk_n_holes))
-                half = n // 2
-                for i in range(-half, n - half):
-                    _draw_wire_y(i * cell_x, z_wire, r_wire, ROOT.kCyan + 2, 0.9)
+            if z_wire is not None and vz - max_half * s <= z_wire <= vz + max_half * s:
+                for i in view.tile_range():
+                    view.draw_wire_y(i * cell_x, z_wire, r_wire, ROOT.kCyan + 2, 0.9)
 
             # The two multiplying stages, in distinct colours.
-            _draw_plate(p1, geom.get("hole_x_thgem_cm", [0.0]), ROOT.kOrange + 7)
-            _draw_mesh(mesh, ROOT.kGreen + 2)
+            view.draw_plate(p1, geom.get("hole_x_thgem_cm", [0.0]), ROOT.kOrange + 7)
+            view.draw_mesh(mesh, ROOT.kGreen + 2)
 
             # ── Primary electron drift (blue) ─────────────────────────────────
             px = np.asarray(data["primary_x"][ev])
@@ -3091,7 +3640,7 @@ class ResultsPanel(QTabWidget):
             # remains visible at any zoom level. ROOT's 3D→2D projector handles
             # clipping at the pad boundary automatically.
             if len(px) >= 2:
-                _pl3(px, py, pz, ROOT.kBlue + 1, 2, alpha=0.65)
+                view.pl3(px, py, pz, ROOT.kBlue + 1, 2, alpha=0.65)
 
             # ── Avalanche cloud (orange markers) ──────────────────────────────
             cx_ = np.asarray(data["cloud_x"][ev])
@@ -3121,8 +3670,8 @@ class ResultsPanel(QTabWidget):
                     xs = av_x[off:off + n_seg]
                     ys = av_y[off:off + n_seg]
                     zs = av_z[off:off + n_seg]
-                    for _seg in _clip(xs, ys, zs):
-                        _pl3(*_seg, ROOT.kOrange + 1, 1, alpha=0.40)
+                    for _seg in view.clip_track(xs, ys, zs):
+                        view.pl3(*_seg, ROOT.kOrange + 1, 1, alpha=0.40)
                 off += n_seg
 
             # ── Ion drift paths (colour-coded by destination) ─────────────────
@@ -3154,8 +3703,8 @@ class ResultsPanel(QTabWidget):
                     col = ROOT.kMagenta      # → anode pad
                 else:
                     col = ROOT.kGray + 1     # absorbed on a plate / out of window
-                for _seg in _clip(xs, ys, zs):
-                    _pl3(*_seg, col, 1, alpha=0.55)
+                for _seg in view.clip_track(xs, ys, zs):
+                    view.pl3(*_seg, col, 1, alpha=0.55)
 
             # ── Legend ────────────────────────────────────────────────────────
             self._trk_legend_objects.clear()
@@ -3199,6 +3748,519 @@ class ResultsPanel(QTabWidget):
 
         except Exception as exc:  # noqa: BLE001
             self.append_log(f"[GUI] ROOT 3D tracks error: {exc}")
+
+    # ── Geometry tab ─────────────────────────────────────────────────────
+
+    def load_geometry(self, run_dir: str) -> bool:
+        """Cache <run_dir>/run_config.json for the Geometry tab.
+
+        The tab's source is a run on disk, so any earlier run is inspectable
+        without re-solving.  "derived" is the authority for every geometric and
+        electrical number; the raw "geometry" block is consulted only for the
+        three things "derived" does not echo (the dielectric name,
+        periodic_copies and the grid node counts).
+
+        Caches only — drawing is left to _update_geometry_plot, so a finished
+        run does not pop a ROOT window in front of whatever the user is doing.
+        """
+        cfg_path = Path(run_dir) / "run_config.json"
+        if not cfg_path.exists():
+            self.append_log(f"[GUI] No run_config.json in {run_dir}")
+            return False
+        try:
+            with cfg_path.open("r", encoding="utf-8") as fh:
+                cfg = json.load(fh)
+        except Exception as exc:  # noqa: BLE001
+            self.append_log(f"[GUI] Could not read {cfg_path}: {exc}")
+            return False
+        dv = cfg.get("derived") or {}
+        if not dv.get("mesh") or dv.get("z_max_cm") is None:
+            self.append_log(f"[GUI] {cfg_path} has no usable 'derived' block "
+                            "(written by an older binary?)")
+            return False
+
+        self._geo_cfg  = cfg
+        self._geo_geom = dv
+        self._geo_run_label   = Path(run_dir).name
+        self._geo_last_run_dir = str(run_dir)
+        self._geo_zoom_scale  = 1.0
+        self._geo_pan_x = self._geo_pan_y = self._geo_pan_z = 0.0
+        m = dv["mesh"]
+        self.geo_source_label.setText(
+            f"{self._geo_run_label}  ·  {m.get('model', '?')} mesh  ·  cell "
+            f"{dv.get('cell_x_cm', 0) * 1e4:.0f} × "
+            f"{dv.get('cell_y_cm', 0) * 1e4:.0f} µm")
+        self.geo_last_btn.setEnabled(True)
+        self._geo_update_cut_pos()
+        return True
+
+    def _on_geo_load_run(self):
+        start = str(PROJ_DIR / "results")
+        if not Path(start).exists():
+            start = str(PROJ_DIR)
+        d = QFileDialog.getExistingDirectory(self, "Open run directory", start)
+        if not d:
+            return
+        if self.load_geometry(d):
+            self._update_geometry_plot()
+        else:
+            QMessageBox.warning(
+                self, "No geometry",
+                f"{d}\n\nhas no readable run_config.json with a 'derived' block.")
+
+    def _geo_refresh_if_live(self):
+        """Redraw only if the canvas is already open or the tab is current."""
+        if self._geo_canvas is not None or self.currentIndex() == self._tab_geometry:
+            self._update_geometry_plot()
+
+    def _on_geo_use_last_run(self):
+        if self._geo_last_run_dir and self.load_geometry(self._geo_last_run_dir):
+            self._update_geometry_plot()
+
+    def _geo_cut_extent(self):
+        """(lo, hi) of the tiled geometry along the cut axis, in cm.
+
+        Deliberately the geometry extent and not the view cube: mapping the
+        slider to the cube would make the plane walk whenever you zoom or pan.
+        """
+        dv = self._geo_geom or {}
+        n  = max(1, int(self._geo_n_holes))
+        if self._geo_cut_axis == "z":
+            return dv.get("z_min_cm", 0.0), dv.get("z_max_cm", 1.0)
+        cell = (dv.get("cell_x_cm") if self._geo_cut_axis == "x"
+                else dv.get("cell_y_cm")) or dv.get("pitch_cm", 0.1)
+        return -0.5 * n * cell, 0.5 * n * cell
+
+    def _geo_update_cut_pos(self):
+        if self._geo_cut_axis is None:
+            self.geo_cut_label.setText("—")
+            return
+        lo, hi = self._geo_cut_extent()
+        self._geo_cut_pos = lo + self._geo_cut_frac * (hi - lo)
+        sign = "≥" if self._geo_cut_keep > 0 else "≤"
+        self.geo_cut_label.setText(
+            f"{self._geo_cut_axis} {sign} {self._geo_cut_pos * 1e4:+.1f} µm")
+
+    def _on_geo_cut_axis_changed(self, _idx: int):
+        txt = self.geo_cut_combo.currentText()
+        self._geo_cut_axis = None if txt == "off" else txt
+        on = self._geo_cut_axis is not None
+        self.geo_cut_slider.setEnabled(on)
+        self.geo_flip_btn.setEnabled(on)
+        self._geo_update_cut_pos()
+        self._geo_refresh_if_live()
+
+    def _on_geo_cut_moved(self, value: int):
+        self._geo_cut_frac = value / 1000.0
+        self._geo_update_cut_pos()
+        self._geo_refresh_if_live()
+
+    def _on_geo_flip_cut(self):
+        self._geo_cut_keep = -self._geo_cut_keep
+        self._geo_update_cut_pos()
+        self._geo_refresh_if_live()
+
+    def _on_geo_toggle(self, attr: str, on: bool):
+        setattr(self, attr, bool(on))
+        self._geo_refresh_if_live()
+
+    def _on_geo_cells_changed(self, value: int):
+        self._geo_n_holes = int(value)
+        self._geo_update_cut_pos()      # the x/y extent scales with the tiling
+        self._geo_refresh_if_live()
+
+    def _geo_adjust_zoom(self, factor: float) -> None:
+        self._geo_zoom_scale = max(0.005, min(20.0, self._geo_zoom_scale * factor))
+        self._geo_refresh_if_live()
+
+    def _geo_preset_view(self, phi: float, theta: float,
+                         reset_zoom: bool = False) -> None:
+        self._geo_view_phi   = phi
+        self._geo_view_theta = theta
+        if reset_zoom:
+            self._geo_zoom_scale = 1.0
+            self._geo_pan_x = self._geo_pan_y = self._geo_pan_z = 0.0
+        self._geo_refresh_if_live()
+
+    def _geo_pan(self, axis: str, direction: int) -> None:
+        dv = self._geo_geom or {}
+        cell_x = dv.get("cell_x_cm") or dv.get("pitch_cm", 0.08)
+        z_min  = dv.get("z_min_cm", 0.0)
+        z_max  = dv.get("z_max_cm", 0.6)
+        max_half = max(1.5 * cell_x, 0.5 * max(z_max - z_min, 1e-3))
+        step = max_half * self._geo_zoom_scale * 0.3 * direction
+        if   axis == "x": self._geo_pan_x += step
+        elif axis == "y": self._geo_pan_y += step
+        else:             self._geo_pan_z += step
+        self._geo_refresh_if_live()
+
+    def _geo_pick_detail(self, dv):
+        """Walk the reduction ladder until the projected count fits the budget.
+
+        Returns (n_cells, s_cyl, s_wire, estimate, note).  Never silently draws
+        something other than what is configured: the note is surfaced in the Qt
+        status label, the canvas annotation and the log.
+        """
+        n_want = max(1, int(self._geo_n_holes))
+        note, s_cyl, s_wire, n_try, est = "", 12, 8, n_want, 0
+        for note, s_cyl, s_wire, scale in _GEO_REDUCTION_LADDER:
+            n_try = max(1, int(round(n_want * scale))) if scale else 1
+            est = _GeoView.estimate_objects(dv, n_try, s_cyl, s_wire,
+                                            True, self._geo_show_copies)
+            if est <= _GEO_OBJECT_BUDGET:
+                break
+        return n_try, s_cyl, s_wire, est, (note if (note or n_try != n_want) else "")
+
+    def _update_geometry_plot(self):
+        """Draw the resolved stack into the Geometry canvas."""
+        dv = self._geo_geom
+        if not dv:
+            return
+        cfg = self._geo_cfg or {}
+        n_cells, s_cyl, s_wire, est, note = self._geo_pick_detail(dv)
+        reduced = bool(note) or n_cells != self._geo_n_holes
+        notes = []
+        if reduced:
+            msg = (f"reduced: {note or 'tiling'}; cells "
+                   f"{self._geo_n_holes} → {n_cells}")
+            self.append_log(f"[GUI] Geometry: {msg} "
+                            f"(projected {est} / {_GEO_OBJECT_BUDGET} primitives)")
+
+        cell_x = dv.get("cell_x_cm") or dv.get("pitch_cm", 0.08)
+        cell_y = dv.get("cell_y_cm") or dv.get("pitch_cm", 0.08)
+        pitch  = dv.get("pitch_cm", cell_y)
+        z_min  = dv.get("z_min_cm", 0.0)
+        z_max  = dv.get("z_max_cm", 0.6)
+        z_wire = dv.get("z_wire_cm")
+        r_wire = dv.get("r_wire_cm", 25e-4)
+        z_anode = dv.get("z_anode_cm")
+        z_centre = 0.5 * (z_min + z_max)
+        max_half = max(1.5 * cell_x, 0.5 * max(z_max - z_min, 1e-3))
+
+        try:
+            import ROOT  # noqa: PLC0415
+            ROOT.gROOT.SetBatch(ROOT.gROOT.IsBatch())
+            canvas = self._ensure_canvas("_geo_canvas", "thgem_mesh_geometry",
+                                         "THGEM + mesh Geometry", 1200, 760)
+            # This tab can be the first canvas opened in a session, so it has to
+            # start the ROOT event pump itself.  QTimer.start() is idempotent.
+            self._root_timer.start()
+            canvas.cd()
+            canvas.Clear()
+            self._geo_objects.clear()
+            self._geo_legend_objects.clear()
+
+            # Two pads, not one pad with a right margin: ROOT projects a 3D
+            # TView across the whole pad and ignores its margins, so an
+            # annotation column drawn in NDC on the same pad ends up *under* the
+            # cube.  A dedicated text pad is the only way to reserve the space.
+            cw = canvas.GetWw() or 1200
+            ch = canvas.GetWh() or 760
+            labels = self._geo_show_labels and cw >= 820
+            split  = 0.68 if labels else 1.0
+            pad3d = ROOT.TPad("geo_pad3d", "", 0.0, 0.0, split, 1.0)
+            pad3d.SetFillColor(0)
+            pad3d.SetBorderMode(0)
+            pad3d.Draw()
+            self._geo_objects.append(pad3d)
+            if labels:
+                padtxt = ROOT.TPad("geo_padtxt", "", split, 0.0, 1.0, 1.0)
+                padtxt.SetFillColor(0)
+                padtxt.SetBorderMode(0)
+                padtxt.Draw()
+                self._geo_objects.append(padtxt)
+            else:
+                padtxt = None
+            pad3d.cd()
+            pad3d.SetPhi(self._geo_view_phi)
+            pad3d.SetTheta(self._geo_view_theta)
+
+            s  = self._geo_zoom_scale
+            vx = self._geo_pan_x
+            vy = self._geo_pan_y
+            vz = z_centre + self._geo_pan_z
+            hr = max_half * s
+
+            frame = ROOT.TH3F(
+                "geo_frame",
+                f"THGEM + mesh geometry - {self._geo_run_label};"
+                "x [cm];y [cm];z [cm]",
+                1, vx - hr, vx + hr,
+                1, vy - hr, vy + hr,
+                1, vz - hr, vz + hr,
+            )
+            frame.SetStats(0)
+            frame.SetDirectory(0)   # owned by _geo_objects, not gDirectory
+
+            # Square the 3D pad's inner area so ROOT maps the equal-range cube
+            # without horizontal stretch, whatever size Qt gave the window.
+            pw = cw * split
+            m_top, m_bot = 0.06, 0.10
+            inner_h = ch * (1.0 - m_top - m_bot)
+            m_lr    = max(0.16, 1.0 - inner_h / pw)
+            pad3d.SetTopMargin(m_top)
+            pad3d.SetBottomMargin(m_bot)
+            pad3d.SetLeftMargin(m_lr * 0.55)
+            pad3d.SetRightMargin(m_lr * 0.45)
+            frame.GetXaxis().SetTitleOffset(1.6)
+            frame.GetYaxis().SetTitleOffset(2.5)
+            frame.GetZaxis().SetTitleOffset(1.6)
+            frame.Draw()
+            self._geo_objects.append(frame)
+
+            view = _GeoView(ROOT, self._geo_objects, (vx, vy, vz), hr,
+                            cell_x, cell_y, pitch, n_holes=n_cells,
+                            cut_axis=self._geo_cut_axis,
+                            cut_pos=self._geo_cut_pos,
+                            cut_keep=self._geo_cut_keep,
+                            s_cyl=s_cyl, s_wire=s_wire,
+                            budget=_GEO_OBJECT_BUDGET)
+            try:
+                view.draw_plane_z(z_wire, geo_color("wire_cathode"), 2)
+                view.draw_plane_z(z_anode, geo_color("anode"), 2)
+                if z_wire is not None and vz - hr <= z_wire <= vz + hr:
+                    for i in view.tile_range():
+                        view.draw_wire_y(i * cell_x, z_wire, r_wire,
+                                         geo_color("wire_cathode"), 0.9)
+                view.draw_plate(dv.get("thgem", {}),
+                                dv.get("hole_x_thgem_cm", [0.0]),
+                                geo_color("thgem_diel"), split=True,
+                                col_cu_top=geo_color("thgem_cu_top"),
+                                col_cu_bot=geo_color("thgem_cu_bot"))
+                view.draw_mesh(dv.get("mesh", {}),
+                               geo_color("mesh_lower"), geo_color("mesh_upper"),
+                               style_lower=geo_style("mesh_lower"),
+                               style_upper=geo_style("mesh_upper"))
+                if self._geo_show_copies:
+                    view.draw_copy_footprints(z_min, z_max, geo_color("copies"),
+                                              geo_style("copies"))
+                if self._geo_show_cell:
+                    view.draw_cell_box(z_min, z_max, geo_color("cell"), 3)
+                view.draw_cut_plane(geo_color("cut"), geo_style("cut"))
+            except _BudgetExceeded as exc:
+                notes.append((f"drawing truncated at {exc}", True))
+
+            # Report what was actually drawn, not what was projected — the
+            # estimator is a budgeting tool, not a measurement.  view.n_obj
+            # counts geometry only; the annotation TLatex rows are not in it.
+            self._geo_last_n_obj = view.n_obj
+            if reduced:
+                txt = (f"reduced: {note or 'tiling'}; cells "
+                       f"{self._geo_n_holes} → {n_cells}  ·  "
+                       f"{view.n_obj} primitives (budget {_GEO_OBJECT_BUDGET})")
+                notes.insert(0, (txt.replace("→", "#rightarrow"), True))
+                self.geo_status.setStyleSheet("color: #c0392b; font-size: 11px;")
+            else:
+                txt = f"{view.n_obj} primitives"
+                notes.insert(0, (txt, False))
+                self.geo_status.setStyleSheet("color: grey; font-size: 11px;")
+            self.geo_status.setText(txt)
+
+            if padtxt is not None:
+                # The annotation column carries the colours on its own rows, so
+                # a separate legend would only duplicate it in smaller type.
+                padtxt.cd()
+                self._draw_geo_labels(padtxt, cw, ch, split, dv, cfg, notes)
+            else:
+                pad3d.cd()
+                self._draw_geo_legend(pad3d, dv)
+            canvas.cd()
+            canvas.Update()
+        except Exception as exc:  # noqa: BLE001
+            self.append_log(f"[GUI] ROOT geometry error: {exc}")
+
+    def _on_tab_changed(self, index: int):
+        if index == self._tab_geometry and self._geo_geom and self._geo_canvas is None:
+            self._update_geometry_plot()
+
+    def _draw_geo_labels(self, pad, cw, ch, split, dv, cfg, notes):
+        """Dimension + potential column in the canvas's right margin.
+
+        ROOT has no 3D text, and leader lines into a rotating cube would need a
+        projection we do not have — so this is a flat NDC block in the reserved
+        margin.  No sub-pads: a TPad drawn into a canvas that also gets Clear()ed
+        every redraw is a PyROOT double-ownership trap.
+
+        Font 83/103 is Courier at precision 3, i.e. sized in *pixels*, so the
+        block neither shrinks with the pad geometry nor misaligns its numeric
+        columns.
+
+        Every number comes from the run's own "derived" block.  The gap fields
+        are recomputed here as |dV| / dz rather than read from "fields", which
+        makes the column a live cross-check of the potential chain: if the two
+        ever disagree, the stack is not what the config asked for.
+        """
+        import ROOT  # noqa: PLC0415
+        # Pad-local NDC: the text pad spans (split .. 1) of the canvas width.
+        pw  = cw * (1.0 - split)
+        fs  = 12 if pw >= 340 else 10
+        x_l = 0.02
+        x_r = 0.985
+        y   = [0.985]
+        dy  = (fs * 1.5) / ch
+
+        def row(left, right="", color=ROOT.kBlack, bold=False, gap=0.0):
+            y[0] -= gap
+            for txt, x, align in ((left, x_l, 12), (right, x_r, 32)):
+                if not txt:
+                    continue
+                t = ROOT.TLatex(x, y[0], txt)
+                t.SetNDC(True)
+                t.SetTextFont(103 if bold else 83)
+                t.SetTextSize(fs)
+                t.SetTextColor(color)
+                t.SetTextAlign(align)
+                t.Draw()
+                self._geo_objects.append(t)
+            y[0] -= dy
+
+        def um(c):
+            return c * 1.0e4
+
+        g  = cfg.get("geometry", {})
+        p  = dv.get("thgem", {})
+        m  = dv.get("mesh", {})
+        gr = dv.get("grid", {})
+
+        def gap_of(z_hi, z_lo, v_hi, v_lo):
+            d = z_hi - z_lo
+            return (um(d), abs(v_hi - v_lo) / d * 1e-3) if d > 0 else (0.0, 0.0)
+
+        t_cu   = um(p.get("z_top_cu_top_cm", 0) -
+                    (p.get("z_cen_cm", 0) + p.get("z_diel_half_cm", 0)))
+        t_diel = um(2.0 * p.get("z_diel_half_cm", 0))
+        rim    = um(p.get("r_cu_cm", 0) - p.get("r_hole_cm", 0))
+        d_dr, e_dr = gap_of(dv.get("z_wire_cm", 0), p.get("z_top_cu_top_cm", 0),
+                            dv.get("v_wire", 0), dv.get("v_thgem_top", 0))
+        d_tr, e_tr = gap_of(p.get("z_bot_cu_bot_cm", 0), m.get("z_top_cm", 0),
+                            dv.get("v_thgem_bot", 0), dv.get("v_mesh", 0))
+        d_am, e_am = gap_of(m.get("z_bot_cm", 0), dv.get("z_anode_cm", 0),
+                            dv.get("v_mesh", 0), dv.get("v_anode", 0))
+
+        row(f"GEOMETRY  {self._geo_run_label[:26]}", bold=True)
+        row(f"{m.get('model','?')} mesh #upoint cell "
+            f"{um(dv.get('cell_x_cm',0)):.0f} #times "
+            f"{um(dv.get('cell_y_cm',0)):.0f} #mum")
+
+        row("Stack (top #rightarrow bottom)", bold=True, gap=0.5 * dy)
+        row(" wire cathode", f"z {um(dv.get('z_wire_cm',0)):8.1f} #mum "
+                             f"{dv.get('v_wire',0):+7.0f} V",
+            geo_color("wire_cathode"))
+        row(f"   drift   {d_dr:7.1f} #mum", f"<E> {e_dr:7.2f} kV/cm")
+        row(" THGEM Cu top", f"z {um(p.get('z_top_cu_top_cm',0)):8.1f} #mum "
+                             f"{dv.get('v_thgem_top',0):+7.0f} V",
+            geo_color("thgem_cu_top"))
+        row(f"   {g.get('thgem',{}).get('dielectric_material','?')} "
+            f"{t_diel:.0f} + 2#times{t_cu:.0f} #mum Cu",
+            f"#DeltaV {dv.get('v_thgem_top',0)-dv.get('v_thgem_bot',0):+7.0f} V",
+            geo_color("thgem_diel"))
+        row(" THGEM Cu bottom", f"z {um(p.get('z_bot_cu_bot_cm',0)):8.1f} #mum "
+                                f"{dv.get('v_thgem_bot',0):+7.0f} V",
+            geo_color("thgem_cu_bot"))
+        row(f"   transfer {d_tr:6.1f} #mum", f"<E> {e_tr:7.2f} kV/cm")
+        row(" mesh top",    f"z {um(m.get('z_top_cm',0)):8.1f} #mum "
+                            f"{m.get('v_mesh',0):+7.0f} V", geo_color("mesh_upper"))
+        row(" mesh bottom", f"z {um(m.get('z_bot_cm',0)):8.1f} #mum "
+                            f"{m.get('v_mesh',0):+7.0f} V", geo_color("mesh_lower"))
+        row(f"   amplif.  {d_am:6.1f} #mum", f"<E> {e_am:7.2f} kV/cm")
+        row(" anode pad", f"z {um(dv.get('z_anode_cm',0)):8.1f} #mum "
+                          f"{dv.get('v_anode',0):+7.0f} V", geo_color("anode"))
+
+        row("THGEM", bold=True, gap=0.5 * dy)
+        row(f" hole dia. {2*um(p.get('r_hole_cm',0)):.1f} #mum",
+            f"rim {rim:.1f} #mum")
+        row(f" {dv.get('n_holes_x',1)} hole(s)/cell at x = " +
+            ", ".join(f"{um(h) + 0.0:.1f}" for h in dv.get("hole_x_thgem_cm", [0.0])) +
+            " #mum")
+        row(f" lattice shift {um(dv.get('lattice_shift_cm',0)):.1f} #mum",
+            f"{4*(max(2,int(p.get('sectors',4)))-1)}-gon")
+
+        row(f"Mesh ({m.get('model','?')})", bold=True, gap=0.5 * dy)
+        req  = m.get("pitch_requested_um", m.get("pitch_snapped_um", 0))
+        snap = ("" if abs(m.get("pitch_snapped_um", 0) - req) < 1e-6
+                else f"  (asked {req:.1f})")
+        row(f" pitch {m.get('pitch_snapped_um',0):.1f} #mum{snap}",
+            f"{m.get('wires_per_hole_pitch',1)} / hole pitch")
+        if m.get("model") == "woven":
+            row(f" wire dia. {2*um(m.get('r_wire_cm',0)):.1f} #mum",
+                f"{m.get('n_x',1)} #times {m.get('n_y',1)} / cell")
+            # Two colours, one conductor: the split says which layer is
+            # which, not that the mesh is two electrodes.
+            row(" both layers = one electrode", "", ROOT.kGray + 2)
+            row(" lower || y  (wires along y)",
+                f"z {um(m.get('z_lower_cm',0)):8.1f} #mum",
+                geo_color("mesh_lower"))
+            row(" upper || x  (wires along x)",
+                f"z {um(m.get('z_upper_cm',0)):8.1f} #mum",
+                geo_color("mesh_upper"))
+        else:
+            row(f" aperture {2*um(m.get('r_aperture_cm',0)):.1f} #mum "
+                f"({4*(max(2,int(m.get('sectors',4)))-1)}-gon)",
+                f"{m.get('n_x',1)} #times {m.get('n_y',1)} / cell")
+        row(f" thickness {um(m.get('thickness_cm',0)):.1f} #mum",
+            f"T_{{opt}} {m.get('optical_transparency',0)*100:.1f} %")
+
+        row("Transport grid", bold=True, gap=0.5 * dy)
+        row(f" #Delta {um(gr.get('dx_cm',0)):.2f} #times {um(gr.get('dy_cm',0)):.2f}"
+            f" #times {um(gr.get('dz_cm',0)):.2f} #mum")
+        n_feat = gr.get("nodes_across_mesh_feature", 0)
+        n_amp  = gr.get("cells_per_amp_gap", 0)
+        # Same thresholds the binary's own field validation warns at.
+        row(" nodes / mesh feature", f"{n_feat:6.2f}",
+            ROOT.kRed + 1 if n_feat < 3.0 else ROOT.kBlack)
+        row(f"   (feature {um(gr.get('mesh_feature_cm',0)):.1f} #mum)")
+        row(" cells / amp gap", f"{n_amp:6.2f}",
+            ROOT.kRed + 1 if n_amp < 10.0 else ROOT.kBlack)
+
+        row("View", bold=True, gap=0.5 * dy)
+        row(" neBEM cell (solved, heavy)", f"pc {g.get('periodic_copies','?')}",
+            geo_color("cell"))
+        if self._geo_show_copies:
+            row(f" display copies (tiled, dotted)",
+                f"{self._geo_n_holes}#times{self._geo_n_holes}",
+                geo_color("copies"))
+        if self._geo_cut_axis:
+            sgn = "#geq" if self._geo_cut_keep > 0 else "#leq"
+            row(f" cut: {self._geo_cut_axis} {sgn} "
+                f"{um(self._geo_cut_pos):+.1f} #mum")
+        for note, warn in notes:
+            row(f" {note}", color=ROOT.kRed + 1 if warn else ROOT.kGray + 2)
+
+    def _draw_geo_legend(self, pad, dv):
+        """Colour key, under the annotation column when there is one."""
+        import ROOT  # noqa: PLC0415
+        woven = (dv.get("mesh", {}).get("model") == "woven")
+        entries = [
+            ("wire_cathode", "Wire cathode"),
+            ("thgem_cu_top", "THGEM Cu top"),
+            ("thgem_diel",   "THGEM dielectric bore"),
+            ("thgem_cu_bot", "THGEM Cu bottom (rim)"),
+        ]
+        if woven:
+            # One electrode at one potential; two colours say which layer.
+            entries += [("mesh_upper", "Mesh #parallel x (upper)"),
+                        ("mesh_lower", "Mesh #parallel y (lower)")]
+        else:
+            entries += [("mesh_lower", "Mesh apertures")]
+        entries += [("anode",  "Anode pad"),
+                    ("cell",   "neBEM cell (solved)"),
+                    ("copies", "display copies (tiled)")]
+        if self._geo_cut_axis:
+            entries.append(("cut", "cut plane"))
+
+        leg = ROOT.TLegend(0.68, 0.02, 0.99, 0.02 + 0.030 * len(entries))
+        leg.SetBorderSize(0)
+        leg.SetFillColorAlpha(ROOT.kWhite, 0.75)
+        leg.SetTextSize(0.024)
+        for key, text in entries:
+            ln = ROOT.TLine()
+            ln.SetLineColor(geo_color(key))
+            ln.SetLineStyle(geo_style(key))
+            ln.SetLineWidth(3 if key == "cell" else 2)
+            leg.AddEntry(ln, text, "L")
+            self._geo_legend_objects.append(ln)
+        leg.Draw()
+        self._geo_legend_objects.append(leg)
 
     def _trk_adjust_zoom(self, factor: float) -> None:
         """Scale the visible axis range and redraw (factor < 1 = zoom in)."""
@@ -3826,6 +4888,8 @@ class MainWindow(QMainWindow):
             self.results_panel.draw_plots(csv_path)
         self.results_panel.load_waveform_data(root_path)
         self.results_panel.load_track_data(root_path, run_dir)
+        if self.results_panel.load_geometry(run_dir):
+            self.results_panel._geo_refresh_if_live()
         self.results_panel.load_field_maps(root_path)
         self.results_panel.load_weighting_maps(root_path)
         self._try_load_gas_props()
@@ -3908,7 +4972,8 @@ class MainWindow(QMainWindow):
             import ROOT  # noqa: PLC0415
             for _canvas in [rp._root_canvas, rp._charge_canvas,
                             rp._tracks_canvas, rp._efield_root_canvas,
-                            rp._wfield_root_canvas, rp._gas_canvas]:
+                            rp._wfield_root_canvas, rp._gas_canvas,
+                            rp._geo_canvas]:
                 try:
                     if (_canvas is not None and
                             ROOT.gROOT.GetListOfCanvases()

@@ -288,6 +288,32 @@ Two pieces of arithmetic are duplicated in Python **on purpose**: `_update_deriv
 potential chain) and `_update_mesh_derived` (the snap and the optical transparency). A drift between
 the GUI and the C++ then shows up as a disagreement between two labels, before anything is solved.
 
+### The Geometry tab and `_GeoView`
+
+The wireframe drawers (`draw_plane_z`, `draw_cylinder`, `draw_wire`, `draw_plate`, `draw_mesh`,
+`draw_cell_box`, `draw_copy_footprints`, `draw_cut_plane`) live on the module-level `_GeoView`
+painter, shared by the Geometry and 3D Tracks tabs. They used to be nested closures inside
+`_update_track_plot` capturing the view centre from locals named `px/py/pz` — which that method
+**rebinds to the primary track's coordinate arrays** partway through, so the avalanche and ion
+drift-line clipping compared against the track instead of the view cube and raised, aborting the draw
+before the legend and `Update()`. Making the cube an explicit constructor argument removes the
+collision structurally; the locals are now `vx/vy/vz`.
+
+The cut plane is `keep·(c − pos) ≥ 0` with three behaviours: truncate an interval extent along the
+cut axis, restrict a round cross-section to its surviving arc (closed form — the kept set of a circle
+under a half-plane is a single arc), or cull a zero-thickness plane. Facet density is held constant
+per unit angle so a sliver is not drawn with a full ring's worth of lines.
+
+Two pads, not one: ROOT projects a 3D `TView` across the whole pad and **ignores its margins**, so an
+annotation column drawn in NDC on the same pad ends up underneath the cube. `pad3d` takes the left
+68 %, `padtxt` the rest.
+
+`_GeoView.estimate_objects` is a pure function used to pick a rung of `_GEO_REDUCTION_LADDER` before
+anything is drawn; `_add` raises `_BudgetExceeded` at 1.25× the budget as a backstop, so an estimator
+miss degrades to a labelled partial picture rather than a hang. The scaling asymmetry is worth
+remembering: a woven mesh costs O(n·k) because its wires span the view and tile in one index, while a
+perforated one costs O(n²·k²) because every aperture is its own barrel.
+
 `_root_geometry_lines` draws the x–z overlay. Note what that slice does to a woven mesh: it cuts the
 lower layer (∥ y) transversely — ticks — while the upper layer (∥ x) is cut lengthwise and cannot be
 resolved in x. The upper layer is a single dashed line marking its plane, **not** a solid sheet.
