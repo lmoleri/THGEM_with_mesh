@@ -1,0 +1,92 @@
+{
+  "geometry": {
+    "hole_pitch_um": 1000.0,
+    "wire_diameter_um": 50.0,
+    "holes_per_wire": 1,
+    "wire_between_holes": false,
+    "drift_gap_mm": 2.0,
+    "transfer_gap_mm": 1.0,
+    "amplification_gap_mm": 0.3,
+    "thgem": {
+      "hole_diameter_um": 500.0,
+      "plate_thickness_um": 400.0,
+      "copper_thickness_um": 35.0,
+      "rim_um": 100.0,
+      "dielectric_material": "fr4"
+    },
+    "mesh": {
+      "model": "perforated",
+      "pitch_um": 500.0,
+      "wire_diameter_um": 50.0,
+      "thickness_um": 100.0,
+      "aperture_um": 300.0,
+      "aperture_sectors": 4,
+      "offset_x_um": 0.0,
+      "offset_y_um": 0.0,
+      "element_size_um": 0.0
+    },
+    "target_element_size_um": 120.0,
+    "thgem_element_size_um": 0.0,
+    "min_elements": 2,
+    "max_elements": 4,
+    "max_elements_budget": 8000,
+    "periodic_copies": 9,
+    "hole_sectors": 4,
+    "grid_nx": 41,
+    "grid_ny": 41,
+    "grid_nz": 241
+  },
+  "fields": {
+    "e_drift_kvcm": 0.5,
+    "delta_v_thgem_V": 1200.0,
+    "e_transfer_kvcm": 1.0,
+    "e_amplification_kvcm": 30.0
+  },
+  "readout": {
+    "electrodes": [
+      "anode"
+    ]
+  },
+  "source": {
+    "energy_keV": 5.9,
+    "source_distances_mm": [
+      1.0
+    ],
+    "x_positions_cm": null
+  },
+  "gas": {
+    "gas1": "ar",
+    "gas1_fraction_pct": 70.0,
+    "gas2": "co2",
+    "ion_species": "co2",
+    "temperature_K": 293.0,
+    "pressure_Torr": 760.0,
+    "enable_penning": true,
+    "n_magboltz_collisions": 2,
+    "w_value_eV": 26.0,
+    "max_electron_energy_eV": 2000.0,
+    "transport_max_energy_eV": 200.0,
+    "n_field_points": 10,
+    "e_field_min_vcm": 100.0,
+    "e_field_max_vcm": 400000.0
+  },
+  "simulation": {
+    "n_events": 0,
+    "max_avalanche_size": 200011,
+    "time_window_ns": 800.0,
+    "time_step_ns": 1.0,
+    "enable_ion_drift": false,
+    "store_drift_lines": true,
+    "ion_max_step_um": 5.0,
+    "ion_time_window_ns": 1000000.0,
+    "max_ions_drifted": 200,
+    "random_seed": 0
+  },
+  "amplifier": {
+    "enable": false,
+    "gain_db": 40.0,
+    "input_impedance_ohm": 50.0,
+    "bandwidth_high_hz": 2000000000.0,
+    "output_sample_ns": 0.0
+  }
+}

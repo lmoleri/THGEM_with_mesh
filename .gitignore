@@ -1,0 +1,33 @@
+.DS_Store
+build/
+results/
+cmake-build-*/
+.idea/
+.vscode/
+
+# neBEM working directory (regenerated on every solve)
+neBEMOut/
+
+# neBEM → ComponentGrid sampled-field cache.  Resolving a mesh wire in x and y
+# while still spanning the drift gap in z needs a much finer transport grid than
+# the THGEM siblings: the shipped default is ~75 MB and the 400 LPI working point
+# ~175 MB, on top of one map per readout electrode.  Far too large to commit —
+# they regenerate automatically when missing.
+field_cache/
+
+# Magboltz property sidecar (rewritten on every run; lives next to the .gas in gas/)
+*_props.csv
+
+# ROOT outputs
+*.root
+
+# Python bytecode
+**/__pycache__/
+*.pyc
+*.pyo
+
+# LaTeX build artifacts
+docs/*.pdf
+**/*.aux
+**/*.synctex.gz
+docs/*.log
