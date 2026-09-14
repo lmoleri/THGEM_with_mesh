@@ -558,25 +558,29 @@ class ConfigPanel(QScrollArea):
             "it belongs to neither stage: electrons born there are reported separately as\n"
             "n_born_transfer, and counted in the mesh-transparency denominator.\n"
             "Note also that the mesh's electron transparency scales with\n"
-            "E_amplification / E_transfer — raising this field lowers it.\n"
+            "E_amp / E_transfer — raising this field lowers it.\n"
             "The shipped Magboltz table already reaches 400 kV/cm, so no gas\n"
             "regeneration is needed; raise gas.transport_max_energy_eV for high-field\n"
             "runs to stop the collision-rate table ratcheting up during transport."
         )
-        self.e_amplification = self._dspin(0.0, 100.0, 1.0, 2, 45.0)
-        self.e_amplification.setToolTip(
-            "Amplification-gap field [kV/cm], mesh → anode.\n"
-            "This IS the micromegas gain knob: the mesh is a single conductor, so its\n"
-            "stage has no voltage across it and its gain comes from this field over the\n"
-            "gap (40-60 kV/cm over 64-320 μm in a real device).\n"
-            "It also sets the mesh's electron transparency, through the ratio\n"
-            "E_amplification / E_transfer — below about 20 the mesh collects most of\n"
-            "the charge the THGEM produced instead of passing it through.")
+        self.delta_v_mesh_anode = self._dspin(0.0, 5000.0, 25.0, 1, 900.0)
+        self.delta_v_mesh_anode.setToolTip(
+            "Voltage across the amplification gap, mesh → anode [V].\n"
+            "This IS the micromegas gain knob, and it is a voltage because that is what\n"
+            "a supply is set to — and because it stays put when the geometry moves:\n"
+            "change the gap and the mesh potential is unchanged.\n"
+            "Deliberately not 'ΔV mesh': a mesh is one conductor and so an equipotential,\n"
+            "with no voltage across itself — the name says which two electrodes this\n"
+            "spans. The literature's 40-60 kV/cm over 64-320 μm is 256-1920 V, and\n"
+            "512-768 V at the usual 128 μm gap.\n"
+            "The derived field E = ΔV / gap also sets the mesh's electron transparency,\n"
+            "through E_amp / E_transfer — below about 20 the mesh collects most of the\n"
+            "charge the THGEM produced instead of passing it through.")
 
-        fld_form.addRow("E_drift [kV/cm]",         self.e_drift)
-        fld_form.addRow("ΔV_THGEM [V]",            self.delta_v1)
-        fld_form.addRow("E_transfer [kV/cm]",      self.e_transfer)
-        fld_form.addRow("E_amplification [kV/cm]", self.e_amplification)
+        fld_form.addRow("E_drift [kV/cm]",        self.e_drift)
+        fld_form.addRow("ΔV_THGEM [V]",           self.delta_v1)
+        fld_form.addRow("E_transfer [kV/cm]",     self.e_transfer)
+        fld_form.addRow("ΔV mesh→anode [V]",      self.delta_v_mesh_anode)
 
         self.derived_v_label = QLabel("—")
         self.derived_v_label.setWordWrap(True)
@@ -961,11 +965,13 @@ class ConfigPanel(QScrollArea):
 
     # ── signal wiring ────────────────────────────────────────────────────
 
+    _pending_legacy_note: str | None = None   # set by load_from_dict, popped by MainWindow
+
     def _wire_widgets_connect(self):
         """Connect everything that feeds a live derived readout."""
         for w in (self.drift_gap, self.transfer_gap, self.amplification_gap,
                   self.e_drift, self.delta_v1, self.e_transfer,
-                  self.e_amplification):
+                  self.delta_v_mesh_anode):
             w.valueChanged.connect(self._update_derived_voltages)
         for w in (self.hole_pitch, self.holes_per_wire):
             w.valueChanged.connect(self._update_wire_pitch_label)
@@ -1097,12 +1103,11 @@ class ConfigPanel(QScrollArea):
         d_amp_cm   = self.amplification_gap.value() * 0.1
         d_tr_cm    = self.transfer_gap.value() * 0.1
         d_drift_cm = self.drift_gap.value() * 0.1
-        e_amp_vcm   = self.e_amplification.value() * 1000.0
         e_tr_vcm    = self.e_transfer.value() * 1000.0
         e_drift_vcm = self.e_drift.value() * 1000.0
 
         v_anode = 0.0
-        v_mesh  = v_anode - e_amp_vcm * d_amp_cm
+        v_mesh  = v_anode - self.delta_v_mesh_anode.value()
         v_bot   = v_mesh  - e_tr_vcm * d_tr_cm
         v_top   = v_bot   - self.delta_v1.value()
         v_wire  = v_top   - e_drift_vcm * d_drift_cm
@@ -1114,22 +1119,27 @@ class ConfigPanel(QScrollArea):
         # The mesh's electron transparency is driven by the ratio of the fields
         # on its two sides: the amplification field has to pull the drift lines
         # through the apertures against the transfer field's spread.
+        # E_amp is no longer typed anywhere, so show it: it is what the physics
+        # runs on, and it now moves when the gap does.
+        e_amp = (self.delta_v_mesh_anode.value() / d_amp_cm * 1e-3) if d_amp_cm > 0 else 0.0
         e_tr = self.e_transfer.value()
         if e_tr <= 0.0:
             self.transparency_label.setStyleSheet("font-size: 10px; color: grey;")
             self.transparency_label.setText(
-                "E_amp / E_transfer = ∞  (no transfer field: all charge is pulled through)")
+                f"E_amp {e_amp:.1f} kV/cm · E_amp / E_transfer = ∞  "
+                f"(no transfer field: all charge is pulled through)")
             return
-        ratio = self.e_amplification.value() / e_tr
+        ratio = e_amp / e_tr
         if ratio < 20.0:
             self.transparency_label.setStyleSheet("font-size: 10px; color: #e67e22;")
             self.transparency_label.setText(
-                f"E_amp / E_transfer = {ratio:.1f} — too low for the mesh to be "
-                f"electron-transparent. Charge leaving the THGEM will be collected on "
-                f"the mesh rather than entering the amplification gap.")
+                f"E_amp {e_amp:.1f} kV/cm · E_amp / E_transfer = {ratio:.1f} — too low for "
+                f"the mesh to be electron-transparent. Charge leaving the THGEM will be "
+                f"collected on the mesh rather than entering the amplification gap.")
         else:
             self.transparency_label.setStyleSheet("font-size: 10px; color: grey;")
-            self.transparency_label.setText(f"E_amp / E_transfer = {ratio:.0f}")
+            self.transparency_label.setText(
+                f"E_amp {e_amp:.1f} kV/cm · E_amp / E_transfer = {ratio:.0f}")
 
     def _browse_out_dir(self):
         path = QFileDialog.getExistingDirectory(self, "Select output directory")
@@ -1195,7 +1205,7 @@ class ConfigPanel(QScrollArea):
                 "e_drift_kvcm":         self.e_drift.value(),
                 "delta_v_thgem_V":      self.delta_v1.value(),
                 "e_transfer_kvcm":      self.e_transfer.value(),
-                "e_amplification_kvcm": self.e_amplification.value(),
+                "delta_v_mesh_anode_V": self.delta_v_mesh_anode.value(),
             },
             "readout": {
                 "electrodes": electrodes,
@@ -1242,6 +1252,11 @@ class ConfigPanel(QScrollArea):
             },
         }
 
+    def take_legacy_note(self) -> str:
+        """Pop any message load_from_dict left about a converted retired key."""
+        note, self._pending_legacy_note = self._pending_legacy_note, None
+        return note or ""
+
     def load_from_dict(self, d: dict):
         """Populate all widgets from a config dict (e.g. loaded from JSON)."""
         g = d.get("geometry", {})
@@ -1272,7 +1287,22 @@ class ConfigPanel(QScrollArea):
         self.e_drift.setValue(       fl.get("e_drift_kvcm", 0.5))
         self.delta_v1.setValue(      fl.get("delta_v_thgem_V", 1200.0))
         self.e_transfer.setValue(    fl.get("e_transfer_kvcm", 1.0))
-        self.e_amplification.setValue(fl.get("e_amplification_kvcm", 45.0))
+        # A config carrying the retired key must not silently load the default
+        # and drop the user's working point: the binary hard-errors, and an
+        # editor that quietly substituted would be worse than either.  Convert,
+        # pre-fill, and say so.  The gap is read from the dict rather than the
+        # spinbox, which has already been set but may have clamped.
+        if "e_amplification_kvcm" in fl:
+            kvcm = float(fl["e_amplification_kvcm"])
+            gap_mm = float(g.get("amplification_gap_mm", 0.2))
+            converted = kvcm * 1000.0 * gap_mm * 0.1
+            self.delta_v_mesh_anode.setValue(converted)
+            self._pending_legacy_note = (
+                f"fields.e_amplification_kvcm is retired; converted "
+                f"{kvcm:g} kV/cm over {gap_mm:g} mm to delta_v_mesh_anode_V = "
+                f"{converted:.0f} V. Save the config to make it permanent.")
+        else:
+            self.delta_v_mesh_anode.setValue(fl.get("delta_v_mesh_anode_V", 900.0))
 
         ro = (d.get("readout") or {}).get("electrodes")
         if ro is None:
@@ -1337,6 +1367,7 @@ class ConfigPanel(QScrollArea):
         self._update_wire_pitch_label()
         self._update_mesh_derived()
         self._update_gas_file_label()
+        return self.take_legacy_note()
 
 
 # ---------------------------------------------------------------------------
@@ -1834,7 +1865,8 @@ class _GeoView:
             total += (n * n * len(mesh.get("wire_x_cm") or []) *
                       len(mesh.get("wire_y_cm") or [])) * _per_cyl(
                           mesh.get("sectors", 4))
-        total += 16 + (n * n - 1) * 2 * bool(copies)   # cell box + footprints
+        # cell box: 2 z-face rectangles + 4 vertical edges; footprints: 2 per copy
+        total += 6 + (n * n - 1) * 2 * bool(copies)
         return total
 
 
@@ -4766,16 +4798,21 @@ class MainWindow(QMainWindow):
         # Open on the shipped default configuration so the GUI is a single source
         # of truth with config/default_thgem_mesh.json (avoids widget defaults drifting
         # from the tuned config).  Falls back to the widget defaults if it is absent.
+        _startup_note = ""
         _default_cfg = PROJ_DIR / "config" / "default_thgem_mesh.json"
         if _default_cfg.exists():
             try:
                 with open(_default_cfg) as _f:
-                    self.config_panel.load_from_dict(json.load(_f))
+                    _note = self.config_panel.load_from_dict(json.load(_f))
+                    if _note:
+                        _startup_note = _note
             except Exception:  # noqa: BLE001
                 pass
         self.results_panel = ResultsPanel()
         # Give the E-Field tab live access to the geometry for its overlay.
         self.results_panel.config_panel = self.config_panel
+        if _startup_note:
+            self.results_panel.append_log(f"[GUI] {_startup_note}")
 
         splitter.addWidget(self.config_panel)
         splitter.addWidget(self.results_panel)
@@ -4826,11 +4863,11 @@ class MainWindow(QMainWindow):
             # so a hand-edited config can never crash the run before it starts.
             fl = cfg.get("fields", {})
             v1 = int(fl.get("delta_v_thgem_V", 0))
-            ea = _file_safe_number(fl.get("e_amplification_kvcm", 0.0))
+            ea = int(fl.get("delta_v_mesh_anode_V", 0))
             n  = cfg.get("simulation", {}).get("n_events", 0)
             # n_events 0 is a field-only run; "__field" reads better than "__n0".
             suffix = "field" if n == 0 else f"n{n}"
-            subdir = f"{date_pfx}__dV{v1}V_Ea{ea}__{suffix}"
+            subdir = f"{date_pfx}__dV{v1}V_amp{ea}V__{suffix}"
 
         self.results_panel.clear_log()
         self.results_panel.setCurrentIndex(0)   # show Log tab while running
@@ -4935,9 +4972,12 @@ class MainWindow(QMainWindow):
         try:
             with open(path) as f:
                 d = json.load(f)
-            self.config_panel.load_from_dict(d)
+            note = self.config_panel.load_from_dict(d)
             self._last_loaded_config_path = path
             self.statusBar().showMessage(f"Config loaded from {path}")
+            if note:
+                self.results_panel.append_log(f"[GUI] {note}")
+                QMessageBox.information(self, "Config updated", note)
             self._try_load_gas_props()
         except Exception as exc:  # noqa: BLE001
             QMessageBox.warning(self, "Load failed", str(exc))

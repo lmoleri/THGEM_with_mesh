@@ -40,7 +40,7 @@
     "e_drift_kvcm": 0.5,
     "delta_v_thgem_V": 3000.0,
     "e_transfer_kvcm": 1.0,
-    "e_amplification_kvcm": 60.0
+    "delta_v_mesh_anode_V": 768.0
   },
   "readout": {
     "electrodes": [

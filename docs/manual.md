@@ -32,11 +32,12 @@ A THGEM over a mesh over an anode, under a wire cathode. Two multiplying stages:
   drift gap multiply there. Gain is set by `delta_v_thgem_V`.
 - **Stage 2, the mesh + amplification gap + anode.** This is a micromegas. The mesh is a **single
   conductor**, so — unlike a second THGEM — it has no voltage across it and no gain of its own. The
-  gain belongs to the parallel-plate gap below it, and is set by `e_amplification_kvcm` over
-  `amplification_gap_mm`.
+  gain belongs to the parallel-plate gap below it, set by `delta_v_mesh_anode_V` across
+  `amplification_gap_mm`; what multiplies is the derived field `E = ΔV / d_amp`.
 
-That difference propagates everywhere: there is no `delta_v_mesh_V`, the mesh is one readout
-electrode rather than two, and the anode is mandatory because a 35–65 % open mesh cannot terminate
+That difference propagates everywhere: there is no `delta_v_mesh_V` — the gap's voltage is
+`delta_v_mesh_anode_V`, named after the two electrodes it spans precisely so it cannot be read as a
+drop across the mesh — the mesh is one readout electrode rather than two, and the anode is mandatory because a 35–65 % open mesh cannot terminate
 the gas volume the way a second plate's bottom copper could.
 
 Two mesh models, because the two ends of the pitch range are physically different objects:
@@ -117,7 +118,7 @@ gets exactly one weighting-field solve.
 | file header | the stack diagram, the potential chain, and why the anode is mandatory |
 | `kElec*`, `kAllElectrodeIds` | the shared electrode vocabulary: Solid labels ≡ Sensor names ≡ ROOT branch prefixes ≡ GUI ids |
 | `PlateConfig`, `MeshConfig`, `GeometryConfig`, `FieldConfig`, … | the JSON schema, mirrored into structs with defaults in the member initialisers, so every key is optional |
-| `ReadPlate`, `ReadMesh`, `LoadConfig` | parse + validate; rejects the sibling's dead keys with an explanation |
+| `ReadPlate`, `ReadMesh`, `LoadConfig` | parse + validate; rejects the sibling's dead keys, and this project's own retired `fields.e_amplification_kvcm`, with an explanation and the conversion |
 | `MeshModel`, `PlateGeom`, `MeshGeom`, `ThgemMeshGeom` | computed geometry in cm and V |
 | `WrapToCell`, `InHolePolygon`, `HolePolygonArea` | lattice wrapping and the exact `SolidHole` polygon |
 | `ThgemMeshDetector` | the solids, `InGas`, `InMesh`, `InMeshAperture`, `AddPlate`, `AddMeshWoven`, `AddMeshPerforated`, `ComputeGeom` |
@@ -210,7 +211,8 @@ a field applied across it is almost always too few `periodic_copies`; a reversed
 applied field is ~0 is the configuration, not the solve, and is reported separately.
 
 Beyond the zones: both wire-surface field estimates against the Magboltz table ceiling, the
-`E_amp / E_transfer` ratio (warn below 20), the two grid budgets, and — from `EstimateTransitTimeNs`
+`E_amp / E_transfer` ratio (warn below 20; `E_amp` is derived from `delta_v_mesh_anode_V` and the
+gap, and is carried on `MeshGeom::eAmpKvcm` so nobody re-divides), the two grid budgets, and — from `EstimateTransitTimeNs`
 — the worst-case transit time against `simulation.time_window_ns`.
 
 ## 7. The event loop and the cascade counters
@@ -285,7 +287,8 @@ it never re-derives geometry from the config panel, which may have been edited s
 …`, streaming stdout; exit code 2 is treated as success-with-a-note, not a crash.
 
 Two pieces of arithmetic are duplicated in Python **on purpose**: `_update_derived_voltages` (the
-potential chain) and `_update_mesh_derived` (the snap and the optical transparency). A drift between
+potential chain and the derived amplification field) and `_update_mesh_derived` (the snap and the
+optical transparency). A drift between
 the GUI and the C++ then shows up as a disagreement between two labels, before anything is solved.
 
 ### The Geometry tab and `_GeoView`
@@ -342,10 +345,18 @@ a radius argument because the cathode and mesh wires differ.
 
 ## 11. Extending it
 
-**Add a config knob.** struct → `LoadConfig` → `ConfigToJson` → GUI `to_config_dict` /
+**Add a geometry knob.** struct → `LoadConfig` → `ConfigToJson` → GUI `to_config_dict` /
 `load_from_dict` → **`GeometryKey`**. Forgetting the last one is the classic mistake: the run
 silently reuses a cache solved for different geometry. This project's key deliberately includes the
 discretisation, which the double-THGEM sibling's does not.
+
+**Add a field knob.** The same, except the cache key is **`DeriveFieldCacheName`**, not
+`GeometryKey` — the latter excludes the applied voltages on purpose, so a whole ΔV scan reuses one
+weighting solve. Also `ComputeGeom`, `ValidateField`'s zone table, the startup banner,
+`BuildRunFolderName` **and its mirror in the GUI's run-name builder**, and
+`tools/verify_geometry_view.py`'s `check_fields`. The `e_amplification_kvcm` →
+`delta_v_mesh_anode_V` change touched every one of those; the shorter checklist above would have
+missed five of them.
 
 **Add a readout electrode.** `SetLabel` on the solid + `kAllElectrodeIds` + the GUI's
 `ELECTRODE_IDS` / `_LABELS` / `_COLOR_OFFSETS`. Solids sharing a label become one electrode.

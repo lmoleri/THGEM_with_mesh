@@ -11,9 +11,11 @@
 //                  amplification gap          perforated sheet)
 //              ═══════════════════      anode pad  0 V
 //
-//            The mesh + amplification gap + anode is a micromegas: the second
-//            stage's gain comes from the field across that gap, not from a
-//            voltage across the mesh, because the mesh is a single conductor.
+//            The mesh + amplification gap + anode is a micromegas.  The mesh is
+//            a single conductor and so an equipotential — it has no voltage
+//            across *itself*, unlike a THGEM's two copper faces — but the gap
+//            below it is an ordinary two-electrode gap, set by
+//            delta_v_mesh_anode_V.  The field E = ΔV / d_amp is derived.
 //            The anode is therefore mandatory here — unlike the double-THGEM
 //            sibling, whose second plate's bottom copper could terminate the
 //            volume, a mesh is 35-65 % open and cannot.
@@ -29,7 +31,7 @@
 //            closed form here.  Electrode potentials are derived from the
 //            physics fields, with the anode as the reference:
 //              V_anode     = 0
-//              V_mesh      = V_anode      − E_amp      · d_amp
+//              V_mesh      = V_anode      − ΔV_mesh→anode
 //              V_thgem_bot = V_mesh       − E_transfer · d_transfer
 //              V_thgem_top = V_thgem_bot  − ΔV_THGEM
 //              V_wire      = V_thgem_top  − E_drift    · d_drift
@@ -260,13 +262,22 @@ struct FieldConfig {
                                   // field at a wire surface is far higher
   double deltaVThgemV  = 1200.0;  // voltage across the THGEM (top→bottom Cu) [V]
   double eTransferKvcm = 1.0;     // THGEM → mesh gap field [kV/cm]
-  // Amplification-gap field [kV/cm].  There is deliberately no "delta_v_mesh":
-  // the mesh is one conductor, so its stage has no voltage *across* it, and its
-  // gain is set by this field over the amplification gap — which is exactly how
-  // a micromegas is specified in practice (40-60 kV/cm over 64-320 µm).  The
-  // ratio e_amplification / e_transfer is also what sets the mesh's electron
-  // transparency.
-  double eAmpKvcm      = 45.0;
+  // Voltage across the amplification gap, mesh -> anode [V].
+  //
+  // Deliberately not "delta_v_mesh": a THGEM is two copper faces with a
+  // dielectric between them, so delta_v_thgem_V is a drop across one object,
+  // whereas a mesh is a single conductor and therefore an equipotential —
+  // asking for "the voltage across the mesh" is not a question.  What the
+  // second stage has is an ordinary two-electrode gap, and the name says which
+  // two electrodes it is measured between.
+  //
+  // The gap is set by its voltage rather than its field because that is what a
+  // supply is set to, and because it is the quantity that stays put when the
+  // geometry moves: change amplification_gap_mm and the mesh potential is
+  // unchanged.  The field E = dV / d_amp is derived (MeshGeom::eAmpKvcm) and is
+  // what the physics runs on — the micromegas literature's 40-60 kV/cm over
+  // 64-320 µm is 256-1920 V, and 512-768 V at the usual 128 µm gap.
+  double deltaVMeshAnodeV = 900.0;
 };
 
 // Which electrodes are read out.  Every extra electrode costs one neBEM
@@ -669,7 +680,7 @@ Config LoadConfig(const fs::path& path) {
       throw std::runtime_error(
           "geometry.anode_enabled is not supported: a mesh is 35-65 % open and cannot "
           "terminate the volume, so the anode is always present. Set "
-          "geometry.amplification_gap_mm and fields.e_amplification_kvcm instead.");
+          "geometry.amplification_gap_mm and fields.delta_v_mesh_anode_V instead.");
     if (FindMember(*g, "induction_gap_mm", {"geometry", "induction_gap_mm"}))
       throw std::runtime_error(
           "geometry.induction_gap_mm is not supported: the gap below the mesh is where "
@@ -692,13 +703,27 @@ Config LoadConfig(const fs::path& path) {
     cfg.fields.eDriftKvcm    = ReadDouble(*f, "fields", "e_drift_kvcm",         cfg.fields.eDriftKvcm);
     cfg.fields.deltaVThgemV  = ReadDouble(*f, "fields", "delta_v_thgem_V",      cfg.fields.deltaVThgemV);
     cfg.fields.eTransferKvcm = ReadDouble(*f, "fields", "e_transfer_kvcm",      cfg.fields.eTransferKvcm);
-    cfg.fields.eAmpKvcm      = ReadDouble(*f, "fields", "e_amplification_kvcm", cfg.fields.eAmpKvcm);
+    cfg.fields.deltaVMeshAnodeV = ReadDouble(*f, "fields", "delta_v_mesh_anode_V",
+                                             cfg.fields.deltaVMeshAnodeV);
+    // This project's own retired key.  Refused rather than converted so a run's
+    // config says exactly one thing; the message does the arithmetic.
+    if (const auto* dead = FindMember(*f, "e_amplification_kvcm",
+                                      {"fields", "e_amplification_kvcm"})) {
+      const double kvcm = dead->is_number() ? dead->get<double>() : 0.;
+      throw std::runtime_error(
+          "fields.e_amplification_kvcm is retired: the amplification gap is now set by its "
+          "voltage, not its field, so that changing geometry.amplification_gap_mm does not "
+          "silently move the mesh potential. Use fields.delta_v_mesh_anode_V = "
+          + FormatNumber(kvcm * 1000. * cfg.geometry.amplificationGapMm * 0.1, 1) +
+          " V (" + FormatNumber(kvcm, 3) + " kV/cm over " +
+          FormatNumber(cfg.geometry.amplificationGapMm, 3) + " mm).");
+    }
     for (const char* dead : {"delta_v_thgem1_V", "delta_v_thgem2_V", "e_induction_kvcm"})
       if (FindMember(*f, dead, {"fields", dead}))
         throw std::runtime_error(
             std::string("fields.") + dead + " is not supported: there is one THGEM "
             "(fields.delta_v_thgem_V) and one mesh stage "
-            "(fields.e_amplification_kvcm) here.");
+            "(fields.delta_v_mesh_anode_V) here.");
   }
 
   if (const auto* r = FindSection(root, "readout")) {
@@ -853,10 +878,27 @@ Config LoadConfig(const fs::path& path) {
   if (cfg.fields.deltaVThgemV <= 0.) throw std::runtime_error("fields.delta_v_thgem_V must be positive");
   if (cfg.fields.eDriftKvcm    < 0.) throw std::runtime_error("fields.e_drift_kvcm must be >= 0");
   if (cfg.fields.eTransferKvcm < 0.) throw std::runtime_error("fields.e_transfer_kvcm must be >= 0");
-  if (cfg.fields.eAmpKvcm      < 0.) throw std::runtime_error("fields.e_amplification_kvcm must be >= 0");
-  if (cfg.fields.eAmpKvcm    > 100.)
-    throw std::runtime_error("fields.e_amplification_kvcm above 100 kV/cm is past any real "
-                             "micromegas sparking limit; check the units (kV/cm, not V/cm)");
+  // >= 0, not > 0: unlike delta_v_thgem_V (a THGEM at 0 V stops being a THGEM),
+  // an amplification gap at 0 V is an ordinary collection gap that still
+  // transports charge, and ValidateField's starved-gap branch exists to explain
+  // exactly that case.  The symmetry is with the other two gap knobs.
+  if (cfg.fields.deltaVMeshAnodeV < 0.)
+    throw std::runtime_error("fields.delta_v_mesh_anode_V must be >= 0");
+  // The sparking bound is on the *derived* field, so it follows the gap.  It
+  // lives here rather than in ValidateGeometry because LoadConfig already knows
+  // the gap (parsed and validated > 0 above) and runs before SetupGas — a typo'd
+  // voltage should not cost a Magboltz table first.
+  {
+    const double eAmpKvcm = cfg.fields.deltaVMeshAnodeV /
+                            (cfg.geometry.amplificationGapMm * 0.1) * 1.e-3;
+    if (eAmpKvcm > 100.)
+      throw std::runtime_error(
+          "fields.delta_v_mesh_anode_V = " + FormatNumber(cfg.fields.deltaVMeshAnodeV, 1) +
+          " V over geometry.amplification_gap_mm = " +
+          FormatNumber(cfg.geometry.amplificationGapMm, 3) + " mm is " +
+          FormatNumber(eAmpKvcm, 1) + " kV/cm across the amplification gap, past any real "
+          "micromegas sparking limit. Lower the voltage or widen the gap.");
+  }
 
   // Resolve the readout list: an explicit list is validated against the geometry,
   // an absent one falls back to the single collecting electrode.
@@ -1105,6 +1147,10 @@ struct MeshGeom {
   std::size_t sectors = 4;  // perforated: 2 = square, 3 = octagon, 4 = 12-gon
   double opticalTransparency = 0.;
   double vMesh = 0.;
+  // The amplification-gap field, derived once from delta_v_mesh_anode_V and the
+  // gap.  Kept here so the validation, the banner and the transparency ratio
+  // all read one number rather than each re-dividing.
+  double eAmpKvcm = 0.;
 
   // Centre of wire / aperture i along x, j along y.  Canonically centred on the
   // cell like the hole lattice, so the extremes are ±(cell − pitch)/2 and every
@@ -1513,9 +1559,9 @@ class ThgemMeshDetector {
     // from the field across the amplification gap, not from a ΔV across it.
     const double eDriftVcm    = f.eDriftKvcm    * 1000.0;
     const double eTransferVcm = f.eTransferKvcm * 1000.0;
-    const double eAmpVcm      = f.eAmpKvcm      * 1000.0;
     o.vAnode = 0.0;
-    m.vMesh  = o.vAnode - eAmpVcm      * o.dAmpCm;
+    m.vMesh  = o.vAnode - f.deltaVMeshAnodeV;
+    m.eAmpKvcm = o.dAmpCm > 0. ? f.deltaVMeshAnodeV / o.dAmpCm * 1.e-3 : 0.;
     p.vBot   = m.vMesh  - eTransferVcm * o.dTransferCm;
     p.vTop   = p.vBot   - f.deltaVThgemV;
     o.vWire  = p.vTop   - eDriftVcm    * o.dDriftCm;
@@ -1871,20 +1917,29 @@ std::size_t ValidateField(Garfield::Component& cmp, const ThgemMeshGeom& g,
   // directly.  The THGEM hole is driven by its plate's dV, and the mesh's own
   // z-band by the funnel between two gaps, so neither carries a key — a reversal
   // there is never a "you asked for zero field" case.
+  // `applied` is the field dialled into a gap.  `appliedText` spells out what
+  // was actually *set*, which for the amplification gap is a voltage — without
+  // it the starved-gap warning below would report a volt-named key "is 0.000
+  // kV/cm", which reads as a contradiction.
   struct Zone {
     const char* name; double zLo, zHi, x, y;
-    double appliedKvcm; const char* key;
+    double appliedKvcm; const char* key; std::string appliedText;
   };
   std::vector<Zone> zones;
   zones.push_back({"amplification", g.zAnode, g.mesh.zBot, xM, yM,
-                   f.eAmpKvcm, "fields.e_amplification_kvcm"});
-  zones.push_back({"mesh aperture", g.mesh.zBot, g.mesh.zTop, xM,   yM,   -1., nullptr});
+                   g.mesh.eAmpKvcm, "fields.delta_v_mesh_anode_V",
+                   FormatNumber(f.deltaVMeshAnodeV, 1) + " V (" +
+                   FormatNumber(g.mesh.eAmpKvcm, 3) + " kV/cm over " +
+                   FormatNumber(g.dAmpCm * 10., 3) + " mm)"});
+  zones.push_back({"mesh aperture", g.mesh.zBot, g.mesh.zTop, xM, yM, -1., nullptr, ""});
   zones.push_back({"transfer",      g.mesh.zTop, g.thgem.zBotCuBot, xRef, yRef,
-                   f.eTransferKvcm, "fields.e_transfer_kvcm"});
+                   f.eTransferKvcm, "fields.e_transfer_kvcm",
+                   FormatNumber(f.eTransferKvcm, 3) + " kV/cm"});
   zones.push_back({"THGEM hole",    g.thgem.zBotCuBot, g.thgem.zTopCuTop, xRef, yRef,
-                   -1., nullptr});
+                   -1., nullptr, ""});
   zones.push_back({"drift",         g.thgem.zTopCuTop, g.zWire, xRef, yRef,
-                   f.eDriftKvcm, "fields.e_drift_kvcm"});
+                   f.eDriftKvcm, "fields.e_drift_kvcm",
+                   FormatNumber(f.eDriftKvcm, 3) + " kV/cm"});
 
   const bool offset = (std::abs(xM - xRef) > 1e-9 || std::abs(yM - yRef) > 1e-9);
   std::cout << "\n  Field validation on the THGEM hole axis (x = "
@@ -1952,7 +2007,11 @@ std::size_t ValidateField(Garfield::Component& cmp, const ThgemMeshGeom& g,
   // the two sides — the amplification field has to pull the drift lines through
   // the apertures against the transfer field's spread.  Below ~20 the mesh
   // collects most of the charge the THGEM produced.
-  const double ratio = f.eTransferKvcm > 0. ? f.eAmpKvcm / f.eTransferKvcm : 0.;
+  const double ratio = f.eTransferKvcm > 0. ? g.mesh.eAmpKvcm / f.eTransferKvcm : 0.;
+  std::cout << "    amplification field E_amp = "
+            << FormatNumber(g.mesh.eAmpKvcm, 2) << " kV/cm ("
+            << FormatNumber(f.deltaVMeshAnodeV, 1) << " V over "
+            << FormatNumber(g.dAmpCm * 10., 3) << " mm)\n";
   std::cout << "    field ratio E_amp / E_transfer = "
             << (f.eTransferKvcm > 0. ? FormatNumber(ratio, 1) : std::string("inf")) << "\n";
   if (f.eTransferKvcm > 0. && ratio < 20.) {
@@ -1960,7 +2019,8 @@ std::size_t ValidateField(Garfield::Component& cmp, const ThgemMeshGeom& g,
               << " is too low for the mesh to be electron-transparent.\n"
                  "           Charge leaving the THGEM will be collected on the mesh "
                  "rather than entering\n           the amplification gap. Raise "
-                 "fields.e_amplification_kvcm or lower fields.e_transfer_kvcm.\n";
+                 "fields.delta_v_mesh_anode_V, narrow geometry.amplification_gap_mm,\n"
+                 "           or lower fields.e_transfer_kvcm.\n";
     ++warnings;
   }
 
@@ -1982,8 +2042,8 @@ std::size_t ValidateField(Garfield::Component& cmp, const ThgemMeshGeom& g,
   }
   for (const Zone& z : starvedGaps) {
     std::cout << "\n  WARNING: the on-axis field is reversed in the " << z.name
-              << " gap, whose applied\n           field " << z.key << " is "
-              << FormatNumber(z.appliedKvcm, 3) << " kV/cm.  With no potential across "
+              << " gap, whose applied\n           " << z.key << " is "
+              << z.appliedText << ".  With no potential across "
                  "the gap the\n           neighbouring hole fields are the only thing "
                  "acting there, so they reverse it\n           near the boundary.  That "
                  "is the configuration, not the solve: raise\n           "
@@ -2318,7 +2378,7 @@ std::string DeriveFieldCacheName(const GeometryConfig& g, const MeshGeom& mg,
      << "_dV" << I(f.deltaVThgemV)
      << "_Ed" << FileSafeNumber(f.eDriftKvcm)
      << "_Et" << FileSafeNumber(f.eTransferKvcm)
-     << "_Ea" << FileSafeNumber(f.eAmpKvcm)
+     << "_dVma" << I(f.deltaVMeshAnodeV)
      << "_v1.txt";
   return ss.str();
 }
@@ -2904,7 +2964,7 @@ DistanceSummary RunDistancePoint(const Config& cfg, const ThgemMeshGeom& g,
   // all (see the grid check in ValidateField); measured ~= optical means the
   // funnelling into the apertures is unresolved and the mesh is acting as a
   // pure geometric stop.  The physical answer sits between the two and rises
-  // with fields.e_amplification_kvcm.
+  // with fields.delta_v_mesh_anode_V.
   std::cout << "  [mesh] optical transparency "
             << FormatNumber(g.mesh.opticalTransparency, 3)
             << " (geometric) | electron transparency "
@@ -3207,7 +3267,7 @@ json ConfigToJson(const Config& cfg, const ThgemMeshGeom& g) {
       {"e_drift_kvcm",         cfg.fields.eDriftKvcm},
       {"delta_v_thgem_V",      cfg.fields.deltaVThgemV},
       {"e_transfer_kvcm",      cfg.fields.eTransferKvcm},
-      {"e_amplification_kvcm", cfg.fields.eAmpKvcm}
+      {"delta_v_mesh_anode_V",  cfg.fields.deltaVMeshAnodeV}
     }},
     {"readout", {
       {"electrodes", cfg.readout.electrodes.has_value()
@@ -3285,7 +3345,7 @@ std::string BuildRunFolderName(const Config& cfg) {
   std::ostringstream ss;
   ss << std::put_time(&tm_local, "%y%m%d_%H-%M__")
      << "dV" << static_cast<int>(cfg.fields.deltaVThgemV) << "V_"
-     << "Ea" << FileSafeNumber(cfg.fields.eAmpKvcm) << "__";
+     << "amp" << static_cast<int>(cfg.fields.deltaVMeshAnodeV) << "V__";
   if (cfg.simulation.nEvents == 0) ss << "field";      // field-only run
   else                             ss << "n" << cfg.simulation.nEvents;
   return ss.str();
@@ -3353,8 +3413,8 @@ int main(int argc, char* argv[]) {
               << gc.amplificationGapMm << " mm\n"
               << "  fields  : dV_THGEM " << cfg.fields.deltaVThgemV << " V, E_drift "
               << cfg.fields.eDriftKvcm << " kV/cm, E_transfer "
-              << cfg.fields.eTransferKvcm << " kV/cm, E_amp "
-              << cfg.fields.eAmpKvcm << " kV/cm\n"
+              << cfg.fields.eTransferKvcm << " kV/cm, dV_mesh-anode "
+              << cfg.fields.deltaVMeshAnodeV << " V\n"
               << "  readout : " << elecList << "\n"
               << "  gas     : " << cfg.gas.gas1 << ":" << cfg.gas.gas2 << " "
               << static_cast<int>(cfg.gas.frac1) << ":"

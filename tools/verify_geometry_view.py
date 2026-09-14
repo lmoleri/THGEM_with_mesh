@@ -86,12 +86,21 @@ def check_fields(run_dir):
                                d["v_wire"], d["v_thgem_top"]), f["e_drift_kvcm"]),
         ("e_transfer_kvcm", field(p["z_bot_cu_bot_cm"], m["z_top_cm"],
                                   d["v_thgem_bot"], d["v_mesh"]), f["e_transfer_kvcm"]),
-        ("e_amplification_kvcm", field(m["z_bot_cm"], d["z_anode_cm"],
-                                       d["v_mesh"], d["v_anode"]),
-         f["e_amplification_kvcm"]),
         ("delta_v_thgem_V", d["v_thgem_bot"] - d["v_thgem_top"],
          f["delta_v_thgem_V"]),
     ]
+    # The amplification gap is set by its voltage, so check it as one: comparing
+    # the derived field against delta_v_mesh_anode_V / d_amp would just re-divide
+    # what the config re-multiplied, which proves nothing.
+    if "delta_v_mesh_anode_V" in f:
+        checks.append(("delta_v_mesh_anode_V", d["v_anode"] - d["v_mesh"],
+                       f["delta_v_mesh_anode_V"]))
+    elif "e_amplification_kvcm" in f:
+        # A run from before the reparameterisation: check what it recorded.
+        checks.append(("e_amplification_kvcm (legacy)",
+                       field(m["z_bot_cm"], d["z_anode_cm"],
+                             d["v_mesh"], d["v_anode"]),
+                       f["e_amplification_kvcm"]))
     ok = True
     for name, got, want in checks:
         good = abs(got - want) <= 1e-6 * max(1.0, abs(want))
@@ -124,26 +133,61 @@ def check_budget(mod, run_dir):
         drew = rp._geo_last_n_obj
         _, _, _, est, note = rp._geo_pick_detail(rp._geo_geom)
         err = abs(drew - est) / max(1, est) * 100.0
-        within = err < 12.0
+        # The estimator is exact by construction — it counts the same lines the
+        # drawers emit.  Any drift means a drawer changed and estimate_objects
+        # did not follow, which is precisely the regression worth catching.
+        within = err < 2.0
         under  = drew <= 1.25 * mod._GEO_OBJECT_BUDGET
         ok &= within and under
         print(f"    cells {cells:2d}: drew {drew:5d}  projected {est:5d}"
               f"  ({err:4.1f}% off)  {'ok' if within and under else 'FAIL'}"
               + (f"   [{note}]" if note else ""))
-    # A cut can only ever remove geometry.
+    # A cut removes geometry, but not monotonically in the primitive count:
+    # draw_cylinder always draws both arc-end longitudinals so a section reads
+    # as a cut rather than as a thinner tube, so a cylinder sliced at a grazing
+    # angle costs one line MORE than the whole one did.  The real invariants are
+    # that a cut keeping nothing draws nothing, that one keeping everything
+    # matches the uncut count, and that the two halves of a mid-cut cover the
+    # whole; plus a loose ceiling to catch a runaway.
     rp._geo_n_holes = 3
     rp._geo_cut_axis = None
     rp._geo_update_cut_pos(); rp._update_geometry_plot()
     base = rp._geo_last_n_obj
+    worst = 0
     for axis in ("x", "y", "z"):
         for frac in (0.25, 0.5, 0.75):
             for keep in (-1, 1):
                 rp._geo_cut_axis, rp._geo_cut_frac, rp._geo_cut_keep = axis, frac, keep
                 rp._geo_update_cut_pos(); rp._update_geometry_plot()
-                if rp._geo_last_n_obj > base:
-                    print(f"    cut {axis} {frac} {keep:+d} drew MORE than uncut")
-                    ok = False
-    print(f"    all 18 cut cases <= uncut ({base}): {'ok' if ok else 'FAIL'}")
+                worst = max(worst, rp._geo_last_n_obj)
+    within = worst <= 1.15 * base
+    ok &= within
+    print(f"    18 cut cases: worst {worst} vs uncut {base} "
+          f"({100.0 * worst / max(1, base):.0f} %)  {'ok' if within else 'FAIL'}")
+
+    for axis, frac, keep, want, label in (
+            ("z", 0.0, -1, 0,    "keeps nothing"),
+            ("z", 1.0, -1, base, "keeps everything"),
+    ):
+        rp._geo_cut_axis, rp._geo_cut_frac, rp._geo_cut_keep = axis, frac, keep
+        rp._geo_update_cut_pos(); rp._update_geometry_plot()
+        got = rp._geo_last_n_obj
+        # frac 1 is not a perfect no-op: the plane lands on the topmost cathode
+        # wire's axis, halving its facets.
+        good = (got <= 2) if want == 0 else (got >= 0.95 * base)
+        ok &= good
+        print(f"    cut {axis} frac {frac} {label}: {got} "
+              f"(uncut {base})  {'ok' if good else 'FAIL'}")
+
+    lo_hi = []
+    for keep in (-1, 1):
+        rp._geo_cut_axis, rp._geo_cut_frac, rp._geo_cut_keep = "x", 0.5, keep
+        rp._geo_update_cut_pos(); rp._update_geometry_plot()
+        lo_hi.append(rp._geo_last_n_obj)
+    covers = sum(lo_hi) >= base
+    ok &= covers
+    print(f"    x mid-cut halves {lo_hi[0]} + {lo_hi[1]} >= uncut {base}: "
+          f"{'ok' if covers else 'FAIL'}")
     return ok
 
 

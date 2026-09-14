@@ -24,8 +24,8 @@ avalanche, signal, track and I/O machinery is shared, and the wire cathode is un
 > two-stage avalanche with per-stage gain and a measured mesh transparency, and the GUI's derived
 > readouts checked digit-for-digit against the binary's own. The mesh model itself is validated by
 > the acceptance test below: measured electron transparency sits between the geometric transparency
-> and 1, and rises with the amplification field (0.686 → 0.759 for E_amp 20 → 40 kV/cm on the smoke
-> geometry). Which shipped config was run how is noted in [Configuration](#configuration).
+> and 1, and rises with the amplification field (0.686 → 0.759 for E_amp 20 → 40 kV/cm, i.e.
+> `delta_v_mesh_anode_V` 600 → 1200 V over the smoke geometry's 0.3 mm gap). Which shipped config was run how is noted in [Configuration](#configuration).
 
 ---
 
@@ -42,24 +42,38 @@ avalanche, signal, track and I/O machinery is shared, and the wire cathode is un
             |←── hole pitch p ──→|
 ```
 
-Electrons drift **−z**, toward the anode. The configuration is given in physics terms and the five
-electrode potentials are derived with the anode as the 0 V reference:
+Electrons drift **−z**, toward the anode. The configuration is given in physics terms — voltages across the multiplying
+stages, fields across the transport gaps — and the five electrode potentials are derived with the
+anode as the 0 V reference:
 
 ```math
 \begin{aligned}
 V_\text{anode}      &= 0 \\
-V_\text{mesh}       &= V_\text{anode}      - E_\text{amp} \cdot d_\text{amp} \\
+V_\text{mesh}       &= V_\text{anode}      - \Delta V_\text{mesh\to anode} \\
 V_\text{thgem,bot}  &= V_\text{mesh}       - E_\text{transfer} \cdot d_\text{transfer} \\
 V_\text{thgem,top}  &= V_\text{thgem,bot}  - \Delta V_\text{THGEM} \\
 V_\text{wire}       &= V_\text{thgem,top}  - E_\text{drift} \cdot d_\text{drift}
 \end{aligned}
 ```
 
-**There is no `delta_v_mesh`, and that is the point.** The mesh is a single conductor, so its stage
-has no voltage *across* it: its gain comes from `e_amplification_kvcm` over
-`amplification_gap_mm` — exactly how a micromegas is specified in practice (40–60 kV/cm over
-64–320 µm). The same field also sets how much charge gets through the mesh at all, through the ratio
-`E_amp / E_transfer`.
+**The mesh has no voltage across *itself* — the gap below it does.** A THGEM is two copper faces
+with a dielectric between them, so `delta_v_thgem_V` is a drop across one object. A mesh is a single
+conductor and therefore an equipotential: asking for "the voltage across the mesh" is not a question.
+What the second stage has is an ordinary two-electrode gap, mesh to anode, and that gap has a voltage
+across it like any other. Hence `delta_v_mesh_anode_V`, and deliberately **not** `delta_v_mesh_V` —
+the name says which two electrodes it is measured between.
+
+The gap is given by its voltage rather than its field because that is what a supply is set to, and
+because it is the quantity that stays put when the geometry moves: change `amplification_gap_mm` and
+the mesh potential is unchanged. The field is derived, `E_amp = ΔV / d_amp`, and it is what the
+physics runs on — reported in the banner, the field validation and the Geometry tab, and it is the
+numerator of the transparency ratio `E_amp / E_transfer`. The micromegas literature's 40–60 kV/cm
+over 64–320 µm is 256–1920 V across that range, and 512–768 V at the usual 128 µm gap.
+
+**Why the schema is mixed.** The two multiplying stages are given as voltages and the two transport
+gaps as fields. A multiplying stage is set on a supply and its gain is exponential in the voltage,
+whereas a transport gap's job — drift velocity, diffusion, the transparency ratio — is specified by
+its field, and its voltage is a large uninformative number.
 
 **The anode is mandatory here.** double-THGEM could drop its anode because THGEM 2's bottom copper is
 a continuous conductor that legitimately terminates the gas volume. A mesh is 35–65 % open and cannot:
@@ -146,7 +160,7 @@ and the acceptance line, on every transport run:
 |---|---|
 | ≈ 1.00 | **fail** — the grid is not resolving the mesh; check `nodes across the mesh` |
 | ≈ optical | **fail** — the funnelling into the apertures is unresolved; the mesh is acting as a pure geometric stop |
-| between the two, **rising with `e_amplification_kvcm`** | correct |
+| between the two, **rising with `delta_v_mesh_anode_V`** | correct |
 
 The tempting cheap fix — flagging a node absorbing whenever a wire passes within half a grid cell —
 is deliberately *not* done. It over-blocks, and biases the transparency downward by an amount that
@@ -179,8 +193,15 @@ gap and the mesh's own z-band are probed on the mesh's nearest *open cell* inste
     cathode wire surface (estimate)  |E| ~ 2.78 kV/cm
     mesh wire surface (estimate)     |E| ~ 92.39 kV/cm
     mesh optical transparency 0.562 (woven, geometric)
+    amplification field E_amp = 40 kV/cm (1200 V over 0.3 mm)
     field ratio E_amp / E_transfer = 40
 ```
+
+The `dV` column is what was *measured* between the ends of each sampled interval, not what was
+dialled in. The sample is inset by 2 % at each end, and the amplification row is taken on the mesh's
+open cell, where the potential near `z_mesh_bot` is pulled off `V_mesh` by the aperture — so it reads
+−886 V against an applied `delta_v_mesh_anode_V` of 1200 V. That funnel is the geometry working, not
+a discrepancy; the applied value is echoed in the startup banner.
 
 `Ez > 0` in every zone and a monotonically falling potential are the two things that must hold. A
 **reversed** zone is almost always too few `periodic_copies` — the tiled wire and anode patches only
@@ -192,7 +213,8 @@ Two checks are specific to the mesh:
   is what sets the sparking limit, and it is the field most likely to run off the end of the Magboltz
   table, so it is folded into the table-ceiling check.
 - **Field ratio.** `E_amp / E_transfer` below ~20 warns: at that ratio the mesh collects most of the
-  charge the THGEM produced instead of passing it through.
+  charge the THGEM produced instead of passing it through. `E_amp` is derived as
+  `delta_v_mesh_anode_V / amplification_gap_mm`, so narrowing the gap at fixed voltage raises it.
 
 ## Cascade diagnostics
 
@@ -349,7 +371,7 @@ filename untouched.
 | `geometry` | `hole_pitch_um`, `wire_diameter_um`, `holes_per_wire`, `wire_between_holes`, `drift_gap_mm`, `transfer_gap_mm`, `amplification_gap_mm`, `thgem{…}`, `mesh{…}`, plus the neBEM and transport-grid controls |
 | `geometry.thgem` | `hole_diameter_um`, `plate_thickness_um`, `copper_thickness_um`, `rim_um`, `dielectric_material` |
 | `geometry.mesh` | `model` (`woven`\|`perforated`), `pitch_um`, `wire_diameter_um`, `thickness_um` (0 = auto), `aperture_um`, `aperture_sectors`, `offset_x_um`, `offset_y_um`, `element_size_um` |
-| `fields` | `e_drift_kvcm`, `delta_v_thgem_V`, `e_transfer_kvcm`, `e_amplification_kvcm` |
+| `fields` | `e_drift_kvcm`, `delta_v_thgem_V`, `e_transfer_kvcm`, `delta_v_mesh_anode_V` |
 | `readout` | `electrodes` (null → `anode`) |
 | `source` | `energy_keV`, `source_distances_mm`, `x_positions_cm` |
 | `gas` | mixture, T, p, Penning, Magboltz table bounds |
@@ -361,15 +383,19 @@ Shipped working points:
 | config | what it is | nodes | ε_optical | verified |
 |---|---|---|---|---|
 | `smoke_thgem_mesh.json` | shrunk clone with a fixed seed, used by CTest | 61 k | 0.562 | end to end, incl. transport |
-| `default_thgem_mesh.json` | 1 mm THGEM over a 250 µm woven mesh, 45 kV/cm amplification | 1.0 M | 0.640 | field solved + validated |
+| `default_thgem_mesh.json` | 1 mm THGEM over a 250 µm woven mesh, 900 V across a 200 µm amplification gap (45 kV/cm) | 1.0 M | 0.640 | field solved + validated |
 | `thick_mesh_perforated.json` | the coarse end: a 500 µm perforated sheet, 300 µm apertures | 405 k | 0.270 | field solved + validated |
 | `micromegas_400lpi_woven.json` | a real 400 LPI mesh (62.5 µm, 25 µm wire) under a 500 µm THGEM | 1.3 M | 0.360 | solved + validated, not sampled |
-| `thgem_mesh_3000V_60kVcm.json` | high-gain hybrid: ΔV 3000 V over a 128 µm gap at 60 kV/cm | 1.4 M | 0.640 | solved + validated, not sampled |
+| `thgem_mesh_3000V_amp768V.json` | high-gain hybrid: a thin 170 µm THGEM at 3000 V over a 128 µm amplification gap at 768 V (60 kV/cm) | 1.4 M | 0.640 | solved + validated, not sampled |
 
 "Solved + validated" means the neBEM solve ran and the five-zone field validation passed on it, but
 the multi-hour grid-sampling pass has not been run here — the first run of one of those configs will
 take the time noted below. "Field solved + validated" adds the sampling pass and the validation
 re-run on the interpolated grid.
+
+`fields.e_amplification_kvcm` is retired and rejected with the conversion printed:
+`delta_v_mesh_anode_V = e_amplification_kvcm × 1000 × amplification_gap_mm × 0.1`. The GUI converts it
+for you and says so.
 
 `0.0` means "auto" for `mesh.thickness_um` (woven → 2 × wire diameter) and for the two per-solid
 element sizes. `null` means "unpinned" for `readout.electrodes`, `source.source_distances_mm` and
